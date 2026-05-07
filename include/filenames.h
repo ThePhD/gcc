@@ -54,6 +54,10 @@ extern "C" {
 #  define IS_ABSOLUTE_PATH(f) IS_UNIX_ABSOLUTE_PATH (f)
 #endif
 
+#define IS_ANY_ABSOLUTE_PATH_N(f, n)        \
+  (((n) > 0 && IS_UNIX_ABSOLUTE_PATH (f))   \
+  || ((n) > 1 && IS_DOS_ABSOLUTE_PATH (f)))
+
 #define IS_DIR_SEPARATOR_1(dos_based, c)				\
   (((c) == '/')								\
    || (((c) == '\\') && (dos_based)))

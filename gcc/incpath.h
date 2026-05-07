@@ -18,6 +18,8 @@
 #ifndef GCC_INCPATH_H
 #define GCC_INCPATH_H
 
+#include <stddef.h>
+
 /* Various fragments of include path.  */
 enum incpath_kind {
   INC_QUOTE = 0, /* include "foo" */
@@ -28,6 +30,8 @@ enum incpath_kind {
   INC_MAX
 };
 
+typedef struct cpp_dep_pattern cpp_dep_pattern;
+
 extern void split_quote_chain (void);
 extern void add_path (char *, incpath_kind, int, bool);
 extern void register_include_chains (cpp_reader *, const char *,
@@ -35,6 +39,22 @@ extern void register_include_chains (cpp_reader *, const char *,
 				     int, int, int);
 extern void add_cpp_dir_path (struct cpp_dir *, incpath_kind);
 extern struct cpp_dir *get_added_cpp_dirs (incpath_kind);
+
+extern void add_cpp_dep_pattern (cpp_dep_pattern *);
+extern struct cpp_dep_pattern *get_cpp_dep_patterns (void);
+extern bool cpp_dep_pattern_simple_check (const char*, unsigned int);
+extern bool cpp_dep_pattern_check (const char*, unsigned int,
+				   const char*, unsigned int);
+
+extern bool search_path_kind (const char *path, unsigned int path_len,
+			      incpath_kind kind, const char *maybe_lookup_dir,
+			      const char **result_path, cpp_dir **found_dir);
+
+extern bool search_path_with_dir (const char *path, unsigned int path_len,
+				  cpp_dir *dir_list,
+				  const char *maybe_lookup_dir,
+				  const char **result_path,
+				  cpp_dir **found_dir);
 
 struct target_c_incpath_s {
   /* Do extra includes processing.  STDINC is false iff -nostdinc was given.  */

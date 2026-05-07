@@ -2991,6 +2991,16 @@
 #endif /* !defined(__cpp_lib_hardened_view_interface) */
 #undef __glibcxx_want_hardened_view_interface
 
+#if !defined(__cpp_lib_embed)
+# if (__cplusplus >  202603L) && (__has_builtin(__builtin_std_embed))
+#  define __glibcxx_embed 202703L
+#  if defined(__glibcxx_want_all) || defined(__glibcxx_want_embed)
+#   define __cpp_lib_embed 202703L
+#  endif
+# endif
+#endif /* !defined(__cpp_lib_embed) */
+#undef __glibcxx_want_embed
+
 #if !defined(__cpp_lib_clmul)
 # if (__cplusplus >  202603L)
 #  define __glibcxx_clmul 202611L

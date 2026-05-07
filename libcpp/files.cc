@@ -28,6 +28,7 @@ along with this program; see the file COPYING3.  If not see
 #include "obstack.h"
 #include "hashtab.h"
 #include "md5.h"
+#include "xregex.h"
 #include <dirent.h>
 
 /* Variable length record files on VMS will have a stat size that includes
@@ -207,6 +208,10 @@ static char *read_filename_string (int ch, FILE *f);
 static void read_name_map (cpp_dir *dir);
 static char *remap_filename (cpp_reader *pfile, _cpp_file *file);
 static char *append_file_to_dir (const char *fname, cpp_dir *dir);
+static char *append_absolute_file_to_dir (const char *fname, cpp_dir *dir);
+static char *append_absolute_file_to_dir_with (const char *fname,
+					       const char *root,
+					       cpp_dir *dir);
 static bool validate_pch (cpp_reader *, _cpp_file *file, const char *pchname);
 static int pchf_save_compare (const void *e1, const void *e2);
 static int pchf_compare (const void *d_p, const void *e_p);
@@ -1007,7 +1012,7 @@ _cpp_stack_translated_file (cpp_reader *pfile, _cpp_file *file,
   /* We don't increment the line number at the end of a buffer,
      because we don't usually need that location (we're popping an
      include file).  However in this case we do want to do the
-     increment.  So push a writable buffer of two newlines to achieve
+     increment.  So push a writable buffer of two newlines to acheive
      that.  (We also need an extra newline, so this looks like a regular
      file, which we do that to to make sure we don't fall off the end in the
      middle of a line.  */
@@ -2000,6 +2005,559 @@ make_cpp_dir (cpp_reader *pfile, const char *dir_name, int sysp)
   return dir;
 }
 
+#define expand_if_necessary(ptr, size, idx, additional_size, small_buf) do \
+{ \
+  if (additional_size > size || idx >= (size - additional_size)) \
+    { \
+      char *new_ptr = XCNEWVEC (char, ((size * 2) + additional_size + 1)); \
+      memcpy (new_ptr, ptr, size * 2); \
+      if (ptr != small_buf) \
+	{ \
+	  free (ptr); \
+	} \
+      ptr = new_ptr; size *= 2; \
+      size += additional_size + 1; \
+    } \
+} while (0)
+#define expand_if_necessary_one(ptr, size, idx, small_buf) do \
+{ \
+  if (idx >= size) \
+    { \
+      char *new_ptr = XCNEWVEC (char, size * 2); \
+      memcpy(new_ptr, ptr, size * 2); \
+      if (ptr != small_buf) \
+	{ \
+	  free (ptr); \
+	} \
+      ptr = new_ptr; \
+      size *= 2; \
+    } \
+} while (0)
+#define dirty_push(ptr, size, idx, c) do { \
+ ptr[idx] = c; \
+ ++idx; \
+  } while(0)
+#define safe_push(ptr, size, idx, c, small_buf) do \
+{ \
+ expand_if_necessary_one (ptr, size, idx, small_buf); \
+ dirty_push (ptr, size, idx, c); \
+} while(0)
+#define safe_append(ptr, size, idx, cfirst, csize, small_buf) do \
+{ \
+  expand_if_necessary (ptr, size, idx, csize, small_buf); \
+  for (unsigned int i = 0; i < csize; ++i) \
+    { \
+      dirty_push (ptr, size, idx, cfirst[i]); \
+    } \
+} while(0)
+
+bool
+cpp_search_path_with_dir (const char *path, unsigned int path_len,
+			  cpp_dir *dir_list,
+			  bool is_angled, cpp_dir *maybe_lookup_dir,
+			  cpp_dir **found_dir)
+{
+  if (path_len == 0 || (maybe_lookup_dir == NULL && dir_list == NULL))
+    {
+      /* Nothing to do.  */
+      if (found_dir)
+	*found_dir = NULL;
+      return false;
+    }
+  if (IS_ANY_ABSOLUTE_PATH_N (path, path_len))
+    {
+      /* There is nothing to put in found_dir, since it was absolute.  */
+      struct stat buf;
+      if (stat (path, &buf) == 0)
+	{
+	  if (found_dir)
+	    *found_dir = NULL;
+	  return true;
+	}
+      return false;
+    }
+
+  char *current_path = NULL;
+  bool result = false;
+  if (maybe_lookup_dir && !is_angled)
+    {
+      /* just try to see if it exists on the local path first  */
+      if (maybe_lookup_dir->construct)
+	current_path = maybe_lookup_dir->construct (path, maybe_lookup_dir);
+      else
+	current_path = append_file_to_dir (path, maybe_lookup_dir);
+      struct stat buf;
+      if (stat (current_path, &buf) == 0)
+	{
+	  if (found_dir)
+	    *found_dir = maybe_lookup_dir;
+	  result = true;
+	  goto done;
+	}
+      free ((void*)current_path);
+      current_path = NULL;
+    }
+
+  for (cpp_dir* dir = dir_list; dir; dir = dir->next)
+    {
+      if (dir->construct)
+	current_path = dir->construct (path, dir);
+      else
+	current_path = append_file_to_dir (path, dir);
+      struct stat buf;
+      if (stat (current_path, &buf) == 0)
+	{
+	  if (found_dir)
+	    *found_dir = dir;
+	  result = true;
+	  goto done;
+	}
+      free ((void*)current_path);
+      current_path = NULL;
+    }
+done:
+  free ((void*)current_path);
+  return result;
+}
+
+cpp_dep_pattern *
+cpp_make_dep_pattern (const char *pattern, unsigned int pattern_len,
+		       bool is_exported, bool is_angled, location_t loc)
+{
+  if (!pattern || pattern_len == 0)
+    return NULL;
+
+  static const char recursive_replacement[] = ".*";
+  static const unsigned int recursive_replacement_size = 2;
+  static const char replacement[] = "[^/\\]*";
+  static const unsigned int replacement_size = 6;
+  static const char separator_replacement[] = "[/\\]";
+  static const unsigned int separator_replacement_size = 4;
+
+  bool single_star_found = false;
+  bool double_star_found = false;
+  unsigned int last_root_separator = 0;
+
+  char small_target_pattern_buffer[512];
+  unsigned int target_pattern_capacity = 512;
+  char *target_pattern = small_target_pattern_buffer;
+  unsigned int target_pattern_size = 0;
+
+  for (unsigned int idx = 0; idx < pattern_len; ++idx)
+    {
+      const char c = pattern[idx];
+      switch (c)
+	{
+	  case '*':
+	    {
+	      if (idx < pattern_len && pattern[idx + 1] == '*')
+		{
+		  double_star_found = true;
+		  safe_append (target_pattern, target_pattern_capacity,
+			      target_pattern_size,
+			      recursive_replacement,
+			      recursive_replacement_size,
+			      small_target_pattern_buffer);
+		  ++idx; // move things forward
+		}
+	      else
+		{
+		  single_star_found = true;
+		  safe_append (target_pattern, target_pattern_capacity,
+			      target_pattern_size,
+			      replacement, replacement_size,
+			      small_target_pattern_buffer);
+		}
+	      break;
+	    }
+	  case ')':
+	  case '(':
+	  case '[':
+	  case ']':
+	  case '{':
+	  case '}':
+	  case '^':
+	  case '$':
+	  case '.':
+	  case '+':
+	  case '?':
+	  case '|':
+	    safe_push (target_pattern, target_pattern_capacity,
+		      target_pattern_size, '\\',
+		      small_target_pattern_buffer);
+	    safe_push (target_pattern, target_pattern_capacity,
+		      target_pattern_size, c,
+		      small_target_pattern_buffer);
+	    break;
+	  case '\\':
+	  case '/':
+	    if (!single_star_found && !double_star_found)
+	      last_root_separator = idx;
+	    safe_append (target_pattern, target_pattern_capacity,
+		      target_pattern_size, separator_replacement,
+		      separator_replacement_size,
+		      small_target_pattern_buffer);
+	    break;
+	  default:
+	    safe_push (target_pattern, target_pattern_capacity,
+		      target_pattern_size, c,
+		      small_target_pattern_buffer);
+	}
+    }
+
+  if (!single_star_found && !double_star_found)
+    {
+      /* High possibility this is a file; root pattern is the whole object.  */
+      last_root_separator = target_pattern_size;
+    }
+
+  safe_append (target_pattern, target_pattern_capacity,
+	      target_pattern_size, "$\0", 2,
+	      small_target_pattern_buffer);
+
+  re_pattern_buffer* buf = XCNEW (re_pattern_buffer);
+  /* Set the RE ryntax we're using -- extended posix is generally the simplest
+     to work with here for the path manipulations we're doing.  */
+  reg_syntax_t old_syntax = re_set_syntax (RE_SYNTAX_POSIX_EXTENDED);
+  const char *regex_err = re_compile_pattern (&target_pattern[0],
+					      target_pattern_size - 1, buf);
+  /* Don't forget to set it back to the old syntax before we started.  */
+  re_set_syntax (old_syntax);
+  if (regex_err != NULL)
+    {
+      free ((void*)buf);
+      return NULL;
+    }
+
+  cpp_dep_pattern *dep = XCNEW (cpp_dep_pattern);
+
+  dep->pattern = XCNEWVEC (char, pattern_len + 1);
+  dep->pattern_len = pattern_len;
+  memcpy (dep->pattern, pattern, pattern_len);
+  dep->pattern[dep->pattern_len] = '\0';
+
+  dep->regex_source = XCNEWVEC (char, target_pattern_size);
+  dep->regex_source_len = target_pattern_size - 1;
+  memcpy (dep->regex_source, target_pattern, target_pattern_size);
+  dep->regex_source[dep->regex_source_len] = '\0';
+
+  dep->pattern_regex = buf;
+
+  const unsigned int pattern_root_len = last_root_separator;
+  dep->pattern_root = XCNEWVEC (char, pattern_root_len + 1);
+  memcpy (dep->pattern_root, pattern, pattern_root_len);
+  dep->pattern_root_len = pattern_root_len;
+  dep->pattern_root[dep->pattern_root_len] = '\0';
+
+  dep->is_exported_p = is_exported;
+  dep->is_angled_p = is_angled;
+  dep->pattern_has_search = single_star_found;
+  dep->pattern_has_recursive_search = double_star_found;
+  dep->loc = loc;
+  dep->next = NULL;
+
+  return dep;
+}
+
+cpp_dep_pattern *
+cpp_copy_dep_pattern (const cpp_dep_pattern *pattern)
+{
+  re_pattern_buffer* buf = XCNEW (re_pattern_buffer);
+  /* Set the RE ryntax we're using -- extended posix is generally the simplest
+     to work with here for the path manipulations we're doing.  */
+  reg_syntax_t old_syntax = re_set_syntax (RE_SYNTAX_POSIX_EXTENDED);
+  const char *regex_err = re_compile_pattern (pattern->regex_source,
+					      pattern->regex_source_len, buf);
+  /* Don't forget to set it back to the old syntax before we started.  */
+  re_set_syntax (old_syntax);
+  if (regex_err != NULL)
+    {
+      free ((void*)buf);
+      return NULL;
+    }
+
+  cpp_dep_pattern *dep = XCNEW (cpp_dep_pattern);
+
+  dep->pattern = XCNEWVEC (char, pattern->pattern_len + 1);
+  dep->pattern_len = pattern->pattern_len;
+  memcpy (dep->pattern, pattern, pattern->pattern_len);
+  dep->pattern[dep->pattern_len] = '\0';
+
+  dep->pattern_root = XCNEWVEC (char, pattern->pattern_root_len + 1);
+  memcpy (dep->pattern_root, pattern, pattern->pattern_root_len);
+  dep->pattern_root_len = pattern->pattern_root_len;
+  dep->pattern_root[dep->pattern_root_len] = '\0';
+
+  dep->pattern_regex = buf;
+
+  dep->regex_source = XCNEWVEC (char, pattern->regex_source_len + 1);
+  dep->regex_source_len = pattern->regex_source_len;
+  memcpy (dep->regex_source, pattern->regex_source, pattern->regex_source_len);
+  dep->pattern[dep->regex_source_len] = '\0';
+
+  dep->is_exported_p = pattern->is_exported_p;
+  dep->is_angled_p = pattern->is_angled_p;
+  dep->pattern_has_search = pattern->pattern_has_search;
+  dep->pattern_has_recursive_search = pattern->pattern_has_recursive_search;
+  dep->loc = pattern->loc;
+  return dep;
+}
+
+cpp_dep_pattern *
+cpp_dep_pattern_tail (cpp_dep_pattern *dep)
+{
+  if (!dep)
+    return NULL;
+  while (dep->next) dep = dep->next;
+  return dep;
+}
+
+void
+cpp_destroy_dep_pattern (cpp_dep_pattern *dep)
+{
+  if (dep == NULL)
+    return;
+  free ((void*)dep->pattern_regex);
+  free ((void*)dep->pattern);
+  free ((void*)dep->pattern_root);
+  free ((void*)dep->regex_source);
+  free ((void*)dep);
+}
+
+void
+cpp_destroy_all_dep_patterns (cpp_dep_pattern *dep)
+{
+  for (cpp_dep_pattern *next = NULL; dep != NULL; dep = next)
+    {
+      next = dep->next;
+      cpp_destroy_dep_pattern (dep);
+    }
+}
+
+bool
+cpp_dep_pattern_simple_check_one (const cpp_dep_pattern *dep,
+				  const char *real_path,
+				  unsigned int real_path_len)
+{
+  if (real_path == NULL || real_path_len == 0 || dep == NULL)
+    return false;
+  /* just check the real path: no need for anything more complicated.  */
+  int real_path_found_at = re_search (dep->pattern_regex,
+				      real_path, real_path_len,
+				      0, real_path_len, NULL);
+  return real_path_found_at >= 0;
+}
+
+bool
+cpp_dep_pattern_check_one (const cpp_dep_pattern *dep,
+			   const char *input, unsigned int input_len,
+			   const char *real_path, unsigned int real_path_len)
+{
+  if (!cpp_dep_pattern_simple_check_one (dep, real_path, real_path_len))
+    return false;
+  if (input == NULL || input_len == 0)
+    return false;
+  /* For the input, it must match AND be front-anchored according
+     to the regular expression's setup. The RE is already end-anchored,
+     our only job now is to just check if it matched at the start, which
+     saves us from having to store 2 regices to test the two different
+     paths.  */
+  int input_match_at = re_search (dep->pattern_regex, input, input_len,
+				      0, input_len, NULL);
+  return input_match_at == 0;
+}
+
+bool
+cpp_dep_pattern_check_from (const cpp_dep_pattern *dep,
+			    const char *input, unsigned int input_len,
+			    const char *real_path, unsigned int real_path_len)
+{
+  const cpp_dep_pattern *p = dep;
+  for (; p != NULL; p = p->next)
+    {
+      if (cpp_dep_pattern_check_one (p, input, input_len,
+				     real_path, real_path_len))
+	return true;
+    }
+  return false;
+}
+
+bool
+cpp_dep_pattern_simple_check_from (const cpp_dep_pattern *dep,
+				   const char *real_path,
+				   unsigned int real_path_len)
+{
+  const cpp_dep_pattern *p = dep;
+  for (; p != NULL; p = p->next)
+    {
+      if (cpp_dep_pattern_simple_check_one (p, real_path, real_path_len))
+	return true;
+    }
+  return false;
+}
+
+void
+_cpp_destroy_dep_patterns (cpp_reader *pfile)
+{
+  cpp_destroy_all_dep_patterns (pfile->depend_patterns);
+  pfile->depend_patterns = NULL;
+}
+
+static int
+add_dir_into_mkdeps (cpp_reader *pfile,
+		     const cpp_dep_pattern *dep, const char *pathname)
+{
+  if (pathname == NULL)
+    return 0;
+  DIR *dp = opendir (pathname);
+  if (dp == NULL)
+    return 0;
+
+  int matches = 0;
+  struct dirent *entry = readdir (dp);
+  for (; entry; entry = readdir (dp))
+    {
+      switch (entry->d_type)
+	{
+	  case DT_DIR:
+	    if (dep->pattern_has_recursive_search
+		&& strcmp(entry->d_name, "..") != 0
+		&& strcmp(entry->d_name, ".") != 0)
+	      {
+		char *entry_name = append_file_to_dir_name (entry->d_name,
+							    pathname);
+		matches += add_dir_into_mkdeps (pfile, dep, entry_name);
+		free ((void *)entry_name);
+	      }
+	    break;
+	   default:
+	    {
+	      char *entry_name = append_file_to_dir_name (entry->d_name,
+							  pathname);
+	      unsigned int entry_name_len = (unsigned int)strlen (entry_name);
+	      if (cpp_dep_pattern_simple_check_one (dep,
+						  entry_name, entry_name_len))
+		{
+		  deps_add_dep (pfile->deps, entry_name);
+		  matches += 1;
+		}
+	      free ((void *)entry_name);
+	    }
+	    break;
+	}
+    }
+
+  closedir (dp);
+  return matches;
+}
+
+void
+_cpp_add_depend (cpp_reader *pfile, const char *pattern,
+		 bool is_exported, bool is_angled, location_t loc)
+{
+  cpp_dep_pattern *dep = cpp_make_dep_pattern (pattern,
+					      (unsigned int)strlen (pattern),
+					      is_exported, is_angled, loc);
+  if (dep == NULL)
+    return;
+  if (!pfile->depend_patterns)
+    {
+      pfile->depend_patterns = dep;
+    }
+  else
+    {
+      cpp_dep_pattern *cur = cpp_dep_pattern_tail (pfile->depend_patterns);
+      cur->next = dep;
+    }
+  dep->next = NULL;
+
+  /* Attempt to fix up paths after-the-fact...  */
+  cpp_dir *cur_dir = _cpp_get_file_dir (cpp_get_file (pfile->buffer));
+  cpp_dir *found_dir = NULL;
+  if (dep->pattern_root_len == 0)
+    {
+      if (!dep->pattern_has_search && !dep->pattern_has_recursive_search)
+	{
+	  /* We have a single non-search file; just try to find it and root
+	     ourselves in that dir.  */
+	  if (cpp_search_path_with_dir (dep->pattern, dep->pattern_len,
+				    pfile->embed_include, is_angled, cur_dir,
+				    &found_dir) && found_dir != NULL)
+	    {
+	      /* We might have a dir we can use here, make sure it works.  */
+	      char* new_pattern_root =
+		append_absolute_file_to_dir (dep->pattern_root, found_dir);
+	      free ((void*)dep->pattern_root);
+	      dep->pattern_root = new_pattern_root;
+	      dep->pattern_root_len = strlen (dep->pattern_root);
+	    }
+	}
+    }
+  else
+    {
+      if (cpp_search_path_with_dir (dep->pattern_root, dep->pattern_root_len,
+				    pfile->embed_include, is_angled, cur_dir,
+				    &found_dir) && found_dir != NULL)
+	{
+	  /* We might have a dir we can use here, make sure it works.  */
+	  char* new_pattern_root =
+	    append_absolute_file_to_dir (dep->pattern_root, found_dir);
+	  free ((void*)dep->pattern_root);
+	  dep->pattern_root = new_pattern_root;
+	  dep->pattern_root_len = strlen (dep->pattern_root);
+	}
+    }
+
+  /* Do callback.  */
+  cpp_callbacks *cbs = cpp_get_callbacks (pfile);
+  if (cbs->depend)
+    cbs->depend (pfile, dep);
+  // if necessary...
+  int sysp = pfile->line_table->highest_line > 1 && pfile->buffer
+    ? pfile->buffer->sysp
+    : 0;
+  bool print_dep = CPP_OPTION (pfile, deps.style) > (is_angled || !!sysp);
+  if (!pfile->deps || !print_dep)
+    return;
+
+  /* Add dependencies to the Makefile.d mkdeps.  */
+  /* For single files, no checking is required; just add it.  */
+  if (!dep->pattern_has_search && !dep->pattern_has_recursive_search)
+    {
+      deps_add_dep (pfile->deps, dep->pattern_root);
+      return;
+    }
+  /* If there is a discernible patternr oon, iterate from there.  */
+  if (dep->pattern_root_len != 0)
+    {
+      add_dir_into_mkdeps (pfile, dep, dep->pattern_root);
+      return;
+    }
+  /* If there is no pattern root, go through ALL embed-dirs so far and pray to
+     find something -- anyhting.  */
+  if (!is_angled && cur_dir)
+    {
+      /* Note that it needs to be absolute to prevent the current
+	 working directory from being the empty string.  */
+      char* maybe_dir_name = _cpp_dir_construct_absolute_path(cur_dir, "");
+      add_dir_into_mkdeps(pfile, dep, maybe_dir_name);
+      free ((void*)maybe_dir_name);
+    }
+  for (cpp_dir *dir = pfile->embed_include; dir != NULL; dir = dir->next)
+    {
+      char* maybe_dir_name = _cpp_dir_construct_absolute_path(dir, "");
+      add_dir_into_mkdeps (pfile, dep, maybe_dir_name);
+      free ((void*)maybe_dir_name);
+      return;
+    }
+}
+
+#undef expand_if_necessary
+#undef expand_if_necessary_one
+#undef dirty_push
+#undef safe_push
+#undef safe_append
+
 /* Create a new block of memory for file hash entries.  */
 static void
 allocate_file_hash_entries (cpp_reader *pfile)
@@ -2377,7 +2935,7 @@ _cpp_get_file_path (_cpp_file *f)
   return f->path;
 }
 
-/* Interface to file statistics record in _cpp_file structure. */
+/* Interface to file statistics record in _cpp_file structure.  */
 struct stat *
 _cpp_get_file_stat (_cpp_file *file)
 {
@@ -2439,6 +2997,102 @@ append_file_to_dir (const char *fname, cpp_dir *dir)
 
   return path;
 }
+
+/* Append the file name to the (absolute) directory to create the path, but
+   don't turn / into // or // into ///; // may be a namespace escape.  */
+static char *
+append_absolute_file_to_dir_with (const char *fname, const char *root,
+				  cpp_dir *dir)
+{
+  if (IS_ANY_ABSOLUTE_PATH_N (dir->name, dir->len))
+    return append_file_to_dir (fname, dir);
+
+  char *path = NULL;
+  size_t root_len = strlen (root);
+  bool root_ends_with_sep = root_len && IS_DIR_SEPARATOR (root[root_len - 1]);
+  size_t dlen = dir->len;
+  size_t flen = strlen (fname);
+  bool ends_with_sep = dlen && IS_DIR_SEPARATOR (dir->name[dlen - 1]);
+  size_t plen = root_len + (root_ends_with_sep ? 0 : 1) + dlen
+		+ flen + (ends_with_sep ? 0 : 1);
+
+  path = XNEWVEC (char, plen + 1);
+  memcpy (path, root, root_len);
+  if (root_len && !root_ends_with_sep)
+    {
+      path[root_len] = '/';
+      ++root_len;
+    }
+  memcpy (path + root_len, dir->name, dlen);
+  if (dlen && !ends_with_sep)
+    {
+      path[root_len + dlen] = '/';
+      ++dlen;
+    }
+  memcpy (path + root_len + dlen, fname, flen + 1);
+
+  return path;
+}
+
+/* Append the file name to the (absolute) directory to create the path, but
+   don't turn / into // or // into ///; // may be a namespace escape.  */
+static char *
+append_absolute_file_to_dir (const char *fname, cpp_dir *dir)
+{
+  char *cwd = getcwd (NULL, 0);
+  char *p = append_absolute_file_to_dir_with (fname, cwd, dir);
+  free ((void*)cwd);
+  return p;
+}
+
+/* Append the file name to the directory to create the path, but don't
+   turn / into // or // into ///; // may be a namespace escape.  */
+char *
+append_file_n_to_dir_name_n (const char *fname, size_t fname_len,
+			   const char *fdir, size_t fdir_len)
+{
+  char *path;
+
+  path = XNEWVEC (char, fdir_len + 1 + fname_len + 1);
+  memcpy (path, fdir, fdir_len);
+  if (fdir_len && !IS_DIR_SEPARATOR (path[fdir_len - 1]))
+    path[fdir_len++] = '/';
+  memcpy (&path[fdir_len], fname, fname_len);
+  path[fdir_len + fname_len] = '\0';
+
+  return path;
+}
+
+/* Append the file name to the directory to create the path, but don't
+   turn / into // or // into ///; // may be a namespace escape.  */
+char *
+append_file_n_to_dir_name (const char *fname, size_t fname_len,
+			   const char *fdir)
+{
+  return append_file_n_to_dir_name_n (fname, fname_len,
+				      fdir, strlen (fdir));
+}
+
+/* Append the file name to the directory to create the path, but don't
+   turn / into // or // into ///; // may be a namespace escape.  */
+char *
+append_file_to_dir_name (const char *fname, const char *fdir)
+{
+  return append_file_n_to_dir_name_n (fname, strlen (fname),
+				      fdir, strlen (fdir));
+}
+
+char *
+_cpp_dir_construct_absolute_path (cpp_dir * dir, const char *path)
+{
+  if (dir == NULL || path == NULL)
+    return NULL;
+  if (dir->construct)
+    return dir->construct(path, dir);
+  else
+    return append_absolute_file_to_dir(path, dir);
+}
+
 
 /* Read a space delimited string of unlimited length from a stdio
    file F.  */
@@ -2641,7 +3295,7 @@ cpp_get_prev (cpp_buffer *b)
 {
   return b->prev;
 }
-
+
 /* This data structure holds the list of header files that were seen
    while the PCH was being built.  The 'entries' field is kept sorted
    in memcmp() order; yes, this means that on little-endian systems,
