@@ -2624,6 +2624,15 @@ ftms = {
     extra_cond = "defined(__glibcxx_ranges) && defined(_GLIBCXX_ASSERTIONS)";
   };
 };
+ 	
+ftms = {
+  name = embed;
+  values = {
+    v =  202611;
+    cxxmin = 29;
+    extra_cond = "__has_builtin(__builtin_std_embed)";
+  };
+};
 
 // Standard test specifications.
 stds[97] = ">= 199711L";

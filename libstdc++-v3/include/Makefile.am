@@ -34,6 +34,7 @@ std_freestanding = \
 	${std_srcdir}/concepts \
 	${std_srcdir}/contracts \
 	${std_srcdir}/coroutine \
+	${std_srcdir}/embed \
 	${std_srcdir}/expected \
 	${std_srcdir}/functional \
 	${std_srcdir}/generator \

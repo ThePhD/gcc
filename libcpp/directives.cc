@@ -62,10 +62,11 @@ struct pragma_entry
    come from traditional (K&R) C.  STDC89 directives come from the
    1989 C standard.  STDC23 directives come from the C23 standard.  EXTENSION
    directives are extensions.  */
-#define KANDR		0
-#define STDC89		1
-#define STDC23		2
-#define EXTENSION	3
+#define KANDR			0
+#define STDC89			1
+#define STDC23			2
+#define STDCXX29		3
+#define EXTENSION		8
 
 /* Values for the flags field of struct directive.  COND indicates a
    conditional; IF_COND an opening conditional.  INCL means to treat
@@ -165,6 +166,7 @@ static void cpp_pop_definition (cpp_reader *, def_pragma_macro *,
   D(pragma,	T_PRAGMA,	STDC89,    IN_I)			\
   D(warning,	T_WARNING,	STDC23,    0)				\
   D(embed,	T_EMBED,	STDC23,    IN_I | INCL | EXPAND)	\
+  D(depend,	T_DEPEND,	STDCXX29,  IN_I | INCL)		\
   D(include_next, T_INCLUDE_NEXT, EXTENSION, INCL | EXPAND)		\
   D(ident,	T_IDENT,	EXTENSION, IN_I)			\
   D(import,	T_IMPORT,	EXTENSION, INCL | EXPAND)  /* ObjC */	\
@@ -1415,7 +1417,7 @@ do_embed (cpp_reader *pfile)
 
   if (CPP_OPTION (pfile, traditional))
     {
-      cpp_error (pfile, CPP_DL_ERROR, /* FIXME should be DL_SORRY */
+      cpp_error (pfile, CPP_DL_ERROR, /* FIXME should be DL_SORRY.  */
 		 "%<#embed%> not supported in traditional C");
       skip_rest_of_line (pfile);
       goto done;
@@ -1469,6 +1471,82 @@ do_embed (cpp_reader *pfile)
 
  done:
   XDELETEVEC (fname);
+}
+
+/* Handle #depend directive.  */
+
+static void
+do_depend (cpp_reader *pfile)
+{
+  int angle_brackets;
+  const char *deppattern = NULL;
+  bool is_exported = false;
+  const cpp_token *maybe_export = NULL;
+  location_t loc;
+
+  /* Re-enable saving of comments if requested, so that the include
+     callback can dump comments which follow #include.  */
+  pfile->state.save_comments = ! CPP_OPTION (pfile, discard_comments);
+
+  /* Tell the lexer this is an depend directive.  */
+  pfile->state.in_directive = 1;
+  if (CPP_OPTION (pfile, traditional))
+    {
+      cpp_error (pfile, CPP_DL_ERROR, /* FIXME should be DL_SORRY.  */
+		 "%qs not supported in traditional C", "#depend");
+      skip_rest_of_line (pfile);
+      goto done;
+    }
+  
+  if (CPP_PEDANTIC (pfile) && !CPP_OPTION (pfile, depend))
+    {
+      if (CPP_OPTION (pfile, cplusplus))
+	cpp_pedwarning (pfile, CPP_W_CXX29_EXTENSIONS,
+			"%<#%s%> before C++29 is a GCC extension",
+			"depend");
+      else
+	cpp_pedwarning (pfile, CPP_W_PEDANTIC,
+			"%<#%s%> before is a GCC extension",
+			"depend");
+    }
+
+
+
+  maybe_export = cpp_peek_token (pfile, 0);
+  if (maybe_export->type == cpp_ttype::CPP_NAME
+      && ustrcmp (maybe_export->val.str.text, UC"export") == 0)
+    {
+      // eat the 'export' token and mark it as an export dir
+      _cpp_lex_token (pfile);
+      is_exported = true;
+    }
+
+  deppattern = parse_include (pfile, &angle_brackets, NULL, &loc);
+  if (!deppattern)
+    {
+      skip_rest_of_line (pfile);
+      goto done;
+    }
+
+  if (!*deppattern)
+    {
+      cpp_error_with_line (pfile, CPP_DL_ERROR, loc, 0,
+			   "empty pattern in #%s",
+			   pfile->directive->name);
+      skip_rest_of_line (pfile);
+      goto done;
+    }
+
+  pfile->state.angled_headers = false;
+  pfile->state.directive_wants_padding = false;
+
+  /* Get out of macro context, if we are.  */
+  skip_rest_of_line (pfile);
+
+  _cpp_add_depend (pfile, deppattern, is_exported, angle_brackets != 0, loc);
+
+ done:
+  XDELETEVEC (deppattern);
 }
 
 /* Subroutine of do_linemarker.  Read possible flags after file name.
@@ -1916,7 +1994,7 @@ register_pragma_internal (cpp_reader *pfile, const char *space,
    goes in the global namespace.  HANDLER is the handler it will call,
    which must be non-NULL.  If ALLOW_EXPANSION is set, allow macro
    expansion while parsing pragma NAME.  This function is exported
-   from libcpp. */
+   from libcpp.  */
 void
 cpp_register_pragma (cpp_reader *pfile, const char *space, const char *name,
 		     pragma_cb handler, bool allow_expansion)
@@ -3410,4 +3488,3 @@ _cpp_bracket_include(cpp_reader *pfile)
 {
   return glue_header_name (pfile);
 }
-

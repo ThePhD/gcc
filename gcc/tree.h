@@ -5079,6 +5079,10 @@ inline tree build_string_literal (tree t)
 			       IDENTIFIER_POINTER (t));
 }
 
+extern tree string_constant (tree, tree *, tree *, tree *);
+extern tree byte_representation (tree, tree *, tree *, tree *);
+extern tree constant_byte_string (tree, tree *, tree *, tree *, bool = false);
+
 /* Construct various nodes representing data types.  */
 
 extern tree signed_or_unsigned_type_for (int, tree);

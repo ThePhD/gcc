@@ -26,6 +26,7 @@
 #include "intl.h"
 #include "incpath.h"
 #include "cppdefault.h"
+#include "xregex.h"
 
 /* Microsoft Windows does not natively support inodes.
    VMS has non-numeric inodes.  */
@@ -62,6 +63,9 @@ static struct cpp_dir *remove_duplicates (cpp_reader *, struct cpp_dir *,
 /* Include chains heads and tails.  */
 static struct cpp_dir *heads[INC_MAX];
 static struct cpp_dir *tails[INC_MAX];
+/* #depend inputs and patterns.  */
+static struct cpp_dep_pattern *deps_head;
+static struct cpp_dep_pattern *deps_tail;
 
 static bool quote_ignores_source_dir;
 enum { REASON_QUIET = 0, REASON_NOENT, REASON_DUP, REASON_DUP_SYS };
@@ -529,6 +533,164 @@ get_added_cpp_dirs (incpath_kind chain)
   return heads[chain];
 }
 
+void
+add_cpp_dep_pattern (cpp_dep_pattern *dep)
+{
+  if (deps_tail)
+    deps_tail->next = dep;
+  else
+    deps_head = dep;
+  dep->next = NULL;
+  deps_tail = dep;
+}
+
+cpp_dep_pattern *
+get_cpp_dep_patterns (void)
+{
+  return deps_head;
+}
+
+bool
+cpp_dep_pattern_check_one (cpp_dep_pattern *dep,
+			   const char *input, unsigned int input_len,
+			   const char *real_path, unsigned int real_path_len)
+{
+  if (!cpp_dep_pattern_simple_check_one (dep, real_path, real_path_len))
+    return false;
+  if (input == NULL || input_len == 0)
+    return false;
+  /* For the input, it must match AND be front-anchored according
+     to the regular expression's setup. The RE is already end-anchored,
+     our only job now is to just check if it matched at the start, which
+     saves us from having to store 2 regices to test the two different
+     paths.  */
+  int input_match_at = re_search (dep->pattern_regex, input, input_len,
+				      0, input_len, NULL);
+  return input_match_at == 0;
+}
+
+bool
+cpp_dep_pattern_check_from (cpp_dep_pattern *dep,
+			    const char *input, unsigned int input_len,
+			    const char *real_path, unsigned int real_path_len)
+{
+  cpp_dep_pattern *p = dep;
+  for (; p != NULL; p = p->next)
+    {
+      if (cpp_dep_pattern_check_one (p, input, input_len,
+				     real_path, real_path_len))
+	return true;
+    }
+  return false;
+}
+
+bool
+cpp_dep_pattern_check (const char *input, unsigned int input_len,
+		       const char *real_path, unsigned int real_path_len)
+{
+  return cpp_dep_pattern_check_from (get_cpp_dep_patterns (),
+				     input, input_len,
+				     real_path, real_path_len);
+}
+
+bool
+cpp_dep_pattern_simple_check (const char *real_path,
+			      unsigned int real_path_len)
+{
+  return cpp_dep_pattern_simple_check_from (get_cpp_dep_patterns (),
+					    real_path, real_path_len);
+}
+
+/* Append the file name to the directory to create the path, but don't
+   turn / into // or // into ///; // may be a namespace escape.  */
+static char *
+append_file_n_to_dir (const char *fname, size_t fname_len, cpp_dir *dir)
+{
+  return append_file_n_to_dir_name_n (fname, fname_len, dir->name, dir->len);
+}
+
+bool
+search_path_kind (const char *path, unsigned int path_len, incpath_kind kind,
+		  const char *maybe_lookup_dir, const char **result_name,
+		  cpp_dir **found_dir)
+{
+  return search_path_with_dir (path, path_len, heads[kind],
+			       maybe_lookup_dir, result_name, found_dir);
+}
+
+bool
+search_path_with_dir (const char *path, unsigned int path_len,
+		      cpp_dir *dir_list, const char *maybe_lookup_dir,
+		      const char **result_name, cpp_dir **found_dir)
+{
+  if (path_len == 0 || (maybe_lookup_dir == NULL && dir_list == NULL))
+    {
+      /* Nothing to do.  */
+      if (found_dir)
+	*found_dir = NULL;
+      return false;
+    }
+  if (IS_ANY_ABSOLUTE_PATH_N(path, path_len))
+    {
+      /* There is nothing to put in found_dir, since it was absolute.  */
+      struct stat buf;
+      if (stat(path, &buf) == 0)
+	{
+	  if (found_dir)
+	    *found_dir = NULL;
+	  return true;
+	}
+      return false;
+    }
+
+  char *current_path = NULL;
+  bool result = false;
+  if (maybe_lookup_dir)
+    {
+      /* Just try to see if it exists on the local path first.  */
+      current_path = append_file_n_to_dir_name (path, path_len,
+					   maybe_lookup_dir);
+      struct stat buf;
+      if (stat (current_path, &buf) == 0)
+	{
+	  if (found_dir)
+	    *found_dir = NULL;
+	  result = true;
+	  goto done;
+	}
+      free ((void*)current_path);
+      current_path = NULL;
+    }
+
+  for (cpp_dir* dir = dir_list; dir; dir = dir->next)
+    {
+      // FIXME: construct takes 2 null-term paths. would need to be fixed.
+      if (dir->construct)
+	current_path = dir->construct (path, dir);
+      else
+	current_path = append_file_n_to_dir (path, path_len, dir);
+      struct stat buf;
+      if (stat (current_path, &buf) == 0)
+	{
+	  if (found_dir)
+	    *found_dir = dir;
+	  result = true;
+	  goto done;
+	}
+      free ((void*)current_path);
+      current_path = NULL;
+    }
+done:
+  if (result_name == NULL || !result)
+    {
+      free ((void*)current_path);
+    }
+
+  if (result_name != NULL)
+    *result_name = result ? current_path : NULL;
+  return result;
+}
+
 #if !(defined TARGET_EXTRA_INCLUDES) || !(defined TARGET_EXTRA_PRE_INCLUDES)
 static void hook_void_charptr_charptr_int (const char *sysroot ATTRIBUTE_UNUSED,
 					   const char *iprefix ATTRIBUTE_UNUSED,
@@ -545,4 +707,3 @@ static void hook_void_charptr_charptr_int (const char *sysroot ATTRIBUTE_UNUSED,
 #endif
 
 struct target_c_incpath_s target_c_incpath = { TARGET_EXTRA_PRE_INCLUDES, TARGET_EXTRA_INCLUDES };
-

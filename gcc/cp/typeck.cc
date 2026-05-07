@@ -12529,3 +12529,152 @@ c_decl_implicit (const_tree)
 {
   return false;
 }
+
+bool
+cp_check_builtin_std_embed (location_t loc, vec<location_t> arg_loc, tree *fn,
+			 tree fndecl, int nargs, tree *args, bool complain)
+{
+  const auto arg_location = [&](int idx) -> location_t
+    {
+      return arg_loc.is_empty ()
+	? cp_expr_loc_or_loc (args[idx], loc)
+	: expansion_point_location (arg_loc[idx]);
+    };
+
+  /* Check the arguments more appropriately.  */
+  if (nargs < 7)
+    {
+      if (complain)
+	error_at (loc, "too few arguments to function %qE", fndecl);
+      return false;
+    }
+  if (nargs > 8)
+    {
+      if (complain)
+	error_at (loc, "too many arguments to function %qE", fndecl);
+      return false;
+    }
+  tree &locus_arg = args[0];
+  if (!INTEGRAL_TYPE_P (TREE_TYPE (locus_arg)))
+    {
+      if (complain)
+	error_at (arg_location (0), "argument 1 to function %qE must "
+				    "be an integral type", fndecl);
+      return false;
+    }
+  tree &status_out_arg = args[1];
+  tree status_out_arg_type = TREE_TYPE (status_out_arg);
+  const bool status_out_is_lvalue = lvalue_p (status_out_arg);
+  const_tree status_out_no_ref_type = TREE_TYPE (status_out_arg_type);
+  if (!status_out_is_lvalue || status_out_no_ref_type != integer_type_node)
+    {
+      if (complain)
+	error_at (arg_location (1), "argument 2 to function %qE must "
+				    "be a reference to an %<int%>", fndecl);
+      return false;
+    }
+  tree &size_out_arg = args[2];
+  tree size_out_arg_type = TREE_TYPE (size_out_arg);
+  const bool size_out_is_lvalue = lvalue_p (size_out_arg);
+  const_tree size_out_no_ref_type = TREE_TYPE (size_out_arg_type);
+  if (!size_out_is_lvalue || size_out_no_ref_type != size_type_node)
+    {
+      if (complain)
+	error_at (arg_location (2),
+		  "argument 3 to function %qE must be a "
+		  "reference to a %<size_t%>", fndecl);
+      return false;
+    }
+  tree &ptr_indicator_arg = args[3];
+  tree ptr_indicator_arg_type = TREE_TYPE (ptr_indicator_arg);
+  if (!POINTER_TYPE_P (ptr_indicator_arg_type))
+    {
+      if (complain)
+	error_at (arg_location (3),
+		  "argument 4 to %qE must be a "
+		  "pointer to a %<const%> integer or enumeration "
+		  "type with a %<sizeof%> and %<alignof%> equal to 1", fndecl);
+      return false;
+    }
+  const_tree const_elem_type = TREE_TYPE (ptr_indicator_arg_type);
+  const bool is_const_elem_type = TYPE_READONLY (const_elem_type);
+  const bool is_valid_elem_type =
+    INTEGRAL_TYPE_P (const_elem_type)
+    && int_size_in_bytes (const_elem_type) == 1
+    && TYPE_ALIGN_UNIT (const_elem_type) == 1;
+  if (!is_const_elem_type || !is_valid_elem_type)
+    {
+      if (complain)
+	error_at (arg_location (3),
+		  "argument 4 to %qE must be a "
+		  "pointer to a %<const%> integer or enumeration "
+		  "type with a %<sizeof%> and %<alignof%> equal to 1", fndecl);
+      return false;
+    }
+  tree &resource_name_size_arg = args[4];
+  tree resource_name_size_arg_type = TREE_TYPE (resource_name_size_arg);
+  if (!INTEGRAL_TYPE_P (resource_name_size_arg_type))
+    {
+      if (complain)
+	error_at (arg_location (4),
+		  "argument 5 to function %qE must be an "
+		  "integral type", fndecl);
+      return false;
+    }
+  tree &resource_name_ptr_arg = args[5];
+  const_tree resource_name_ptr_arg_type = TREE_TYPE (resource_name_ptr_arg);
+  const bool is_resource_name_ptr_arg_ptr =
+    POINTER_TYPE_P (resource_name_ptr_arg_type);
+  const_tree resource_name_elem_type = TREE_TYPE (resource_name_ptr_arg_type);
+  const_tree resource_name_unqual_elem_type =
+    is_resource_name_ptr_arg_ptr
+    ? TYPE_MAIN_VARIANT (resource_name_elem_type)
+    : NULL_TREE;
+  const bool is_valid_name_type = is_resource_name_ptr_arg_ptr
+    ? resource_name_unqual_elem_type == char_type_node
+      || resource_name_unqual_elem_type == wchar_type_node
+      || resource_name_unqual_elem_type == char8_type_node
+    : false ;
+  if (!is_resource_name_ptr_arg_ptr || !is_valid_name_type)
+    {
+      if (complain)
+	error_at (arg_location (5),
+		  "argument 6 to function %qE must be a "
+		  "pointer to %<char%>, %<'wchar_t%>, or %<char8_t%>",
+		  fndecl);
+      return false;
+    }
+  tree &offset_arg = args[6];
+  tree offset_arg_type = TREE_TYPE (offset_arg);
+  if (!INTEGRAL_TYPE_P (offset_arg_type))
+    {
+      if (complain)
+	error_at (arg_location (6),
+		  "argument 7 to function %qE must be an "
+		  "integral type", fndecl);
+      return false;
+    }
+  const bool has_limit_arg = nargs == 8;
+  if (has_limit_arg)
+    {
+      tree &limit_arg = args[7];
+      tree limit_arg_type = TREE_TYPE (limit_arg);
+      if (!INTEGRAL_TYPE_P (limit_arg_type))
+	{
+	  if (complain)
+	    error_at (arg_location (7),
+		      "argument 8 to function %qE must be an "
+		      "integral type", fndecl);
+	  return false;
+	}
+    }
+
+  /* if passed in, the actual function call needs to have the
+     return type adjusted from a generic void* to the actual pointer type.  */
+  if (!fn)
+    return true;
+
+  tree &return_type = TREE_TYPE (*fn);
+  return_type = ptr_indicator_arg_type;
+  return true;
+}

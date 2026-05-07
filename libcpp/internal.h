@@ -359,7 +359,7 @@ struct cpp_buffer
   struct _cpp_file *file;
 
   /* Saved value of __TIMESTAMP__ macro - date and time of last modification
-     of the associated file.  */
+     of the assotiated file.  */
   const unsigned char *timestamp;
 
   /* Value of if_stack at start of this file.
@@ -477,10 +477,11 @@ struct cpp_reader
   bool diagnose_dot_colon_from_macro_p;
 
   /* Search paths for include files.  */
-  struct cpp_dir *quote_include;	/* "" */
-  struct cpp_dir *bracket_include;	/* <> */
-  struct cpp_dir no_search_path;	/* No path.  */
-  struct cpp_dir *embed_include;	/* #embed <> */
+  struct cpp_dir *quote_include;	   /* "" */
+  struct cpp_dir *bracket_include;	 /* <> */
+  struct cpp_dir no_search_path;	   /* No path.  */
+  struct cpp_dir *embed_include;	   /* #embed <> */
+  struct cpp_dep_pattern *depend_patterns; /* #depend <> */
 
   /* Chain of all hashed _cpp_file instances.  */
   struct _cpp_file *all_files;
@@ -550,6 +551,14 @@ struct cpp_reader
   /* Descriptor for converting from the UTF-8 execution character set to the
      source character set.  */
   struct cset_converter reverse_utf8_cset_desc;
+
+  /* Descriptor for converting from the wide literal character set
+     to UTF-8. Used for converting to file names.  */
+  struct cset_converter wide_to_utf8_cset_desc;
+
+  /* Descriptor for converting from the wide literal character set
+     to the narrow character set. Used for converting to file names.  */
+  struct cset_converter wide_to_narrow_cset_desc;
 
   /* Date and time text.  Calculated together if either is requested.  */
   const unsigned char *date;
@@ -784,6 +793,8 @@ extern const char *_cpp_find_header_unit (cpp_reader *, const char *file,
 					  bool angle_p,  location_t);
 extern int _cpp_stack_embed (cpp_reader *, const char *, bool,
 			     cpp_embed_params *);
+extern void _cpp_add_depend (cpp_reader *, const char *, bool, bool,
+			     location_t);
 extern void _cpp_fake_include (cpp_reader *, const char *);
 extern bool _cpp_stack_file (cpp_reader *, _cpp_file*, include_type, location_t);
 extern bool _cpp_stack_include (cpp_reader *, const char *, int,
@@ -792,12 +803,14 @@ extern int _cpp_compare_file_date (cpp_reader *, const char *, int);
 extern void _cpp_report_missing_guards (cpp_reader *);
 extern void _cpp_init_files (cpp_reader *);
 extern void _cpp_cleanup_files (cpp_reader *);
+extern void _cpp_destroy_dep_patterns (cpp_reader *);
 extern void _cpp_pop_file_buffer (cpp_reader *, struct _cpp_file *,
 				  const unsigned char *);
 extern bool _cpp_save_file_entries (cpp_reader *pfile, FILE *f);
 extern bool _cpp_read_file_entries (cpp_reader *, FILE *);
 extern bool _cpp_has_header (cpp_reader *, const char *, int,
 			     enum include_type);
+extern char * _cpp_dir_construct_absolute_path (cpp_dir *, const char *);
 
 /* In expr.cc */
 extern cpp_num_part _cpp_parse_expr (cpp_reader *, const char *,

@@ -132,6 +132,7 @@ static void add_prefixed_path (const char *, incpath_kind);
 static void push_command_line_include (void);
 static void cb_file_change (cpp_reader *, const line_map_ordinary *);
 static void cb_dir_change (cpp_reader *, const char *);
+static void cb_depend (cpp_reader *, const cpp_dep_pattern *);
 static void c_finish_options (void);
 
 #ifndef STDC_0_IN_SYSTEM_HEADERS
@@ -1330,6 +1331,7 @@ c_common_post_options (const char **pfilename)
   struct cpp_callbacks *cb = cpp_get_callbacks (parse_in);
   cb->file_change = cb_file_change;
   cb->dir_change = cb_dir_change;
+  cb->depend = cb_depend;
   if (lang_hooks.preprocess_options)
     lang_hooks.preprocess_options (parse_in);
   cpp_post_options (parse_in);
@@ -1518,6 +1520,9 @@ c_common_finish (void)
 
   if (out_stream && (ferror (out_stream) || fclose (out_stream)))
     fatal_error (input_location, "when writing output to %s: %m", out_fname);
+
+  /* close out the head/tails of the cpp_dep_patterns shared from the cpplib */
+  cpp_destroy_all_dep_patterns (get_cpp_dep_patterns ());
 }
 
 /* Either of two environment variables can specify output of
@@ -1893,6 +1898,13 @@ cb_dir_change (cpp_reader * ARG_UNUSED (pfile), const char *dir)
 {
   if (!set_src_pwd (dir))
     warning (0, "too late for # directive to set debug directory");
+}
+
+void
+cb_depend (cpp_reader * ARG_UNUSED (pfile), const cpp_dep_pattern *dep)
+{
+  cpp_dep_pattern *copy_dep = cpp_copy_dep_pattern (dep);
+  add_cpp_dep_pattern (copy_dep);
 }
 
 /* Set the C 89 standard (with 1994 amendments if C94, without GNU

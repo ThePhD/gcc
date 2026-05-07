@@ -329,15 +329,6 @@ expand_normal (tree exp)
   return expand_expr_real (exp, NULL_RTX, VOIDmode, EXPAND_NORMAL, NULL, false);
 }
 
-
-/* Return STRING_CST and set offset, size and decl, if the first
-   argument corresponds to a string constant.  */
-extern tree string_constant (tree, tree *, tree *, tree *);
-/* Similar to string_constant, return a STRING_CST corresponding
-   to the value representation of the first argument if it's
-   a constant.  */
-extern tree byte_representation (tree, tree *, tree *, tree *);
-
 extern enum rtx_code convert_tree_comp_to_rtx (enum tree_code, int);
 extern enum tree_code maybe_optimize_mod_cmp (enum tree_code, tree *, tree *);
 extern void maybe_optimize_sub_cmp_0 (enum tree_code, tree *, tree *);

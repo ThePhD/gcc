@@ -396,6 +396,7 @@ std_freestanding = \
 	${std_srcdir}/contracts \
 	${std_srcdir}/coroutine \
 	${std_srcdir}/expected \
+	${std_srcdir}/embed \
 	${std_srcdir}/functional \
 	${std_srcdir}/generator \
 	${std_srcdir}/iterator \

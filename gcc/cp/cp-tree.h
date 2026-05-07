@@ -7262,6 +7262,7 @@ enum cp_built_in_function {
   CP_BUILT_IN_IS_CORRESPONDING_MEMBER,
   CP_BUILT_IN_IS_POINTER_INTERCONVERTIBLE_WITH_CLASS,
   CP_BUILT_IN_SOURCE_LOCATION,
+  CP_BUILT_IN_STD_EMBED,
   CP_BUILT_IN_EH_PTR_ADJUST_REF,
   CP_BUILT_IN_IS_STRING_LITERAL,
   CP_BUILT_IN_CONSTEXPR_DIAG,
@@ -9108,6 +9109,8 @@ extern tree finish_binary_fold_expr          (location_t, tree, tree, int);
 extern tree treat_lvalue_as_rvalue_p	     (tree, bool);
 extern bool decl_in_std_namespace_p	     (tree);
 extern void maybe_warn_pessimizing_move	     (tree, tree, bool);
+extern bool cp_check_builtin_std_embed       (location_t, vec<location_t>,
+					      tree *, tree, int, tree *, bool);
 
 /* in typeck2.cc */
 extern void require_complete_eh_spec_types	(tree, tree);
@@ -9486,6 +9489,8 @@ extern void diagnose_failing_condition		(tree, location_t, bool,
 extern bool replace_decl			(tree *, tree, tree);
 extern tree cxa_allocate_and_throw_exception	(location_t, const constexpr_ctx *,
 						 tree);
+extern tree cp_fold_builtin_std_embed		(location_t, int, location_t *,
+						 tree *);
 
 /* Whether our evaluation wants a prvalue (e.g. CONSTRUCTOR or _CST),
    a glvalue (e.g. VAR_DECL or _REF), or nothing.  */
