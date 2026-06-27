@@ -2412,6 +2412,7 @@ mark_exp_read (tree exp)
       /* FALLTHRU */
     case ARRAY_REF:
     case COMPONENT_REF:
+    case INDIRECT_REF:
     case MODIFY_EXPR:
     case REALPART_EXPR:
     case IMAGPART_EXPR:
@@ -2535,6 +2536,72 @@ default_function_array_conversion (location_t loc, struct c_expr exp)
     }
 
   return exp;
+}
+
+tree
+default_function_array_type_conversion (tree exp)
+{
+  gcc_assert (exp != NULL_TREE);
+  const bool is_type = TYPE_P (exp);
+  tree type = is_type ? exp : TREE_TYPE (exp);
+  enum tree_code code = TREE_CODE (type);
+  switch (code)
+    {
+    case ARRAY_TYPE:
+      if (!is_type)
+	{
+	  bool not_lvalue = false;
+	  bool lvalue_array_p;
+
+	  while ((TREE_CODE (exp) == NON_LVALUE_EXPR
+		|| CONVERT_EXPR_P (exp))
+	       && TREE_TYPE (TREE_OPERAND (exp, 0)) == type)
+	    {
+	      if (TREE_CODE (exp) == NON_LVALUE_EXPR)
+		not_lvalue = true;
+	      exp = TREE_OPERAND (exp, 0);
+	    }
+
+	  lvalue_array_p = !not_lvalue && lvalue_p (exp);
+	  if (!flag_isoc99 && !lvalue_array_p)
+	    {
+	      /* Before C99, non-lvalue arrays do not decay to pointers.
+		 Normally, using such an array would be invalid; but it can
+		 be used correctly inside sizeof or as a statement expression.
+		 Thus, do not give an error here; an error will result later.  */
+	      return TREE_TYPE (exp);
+	    }
+
+	  return c_build_pointer_type (TREE_TYPE (exp));
+	}
+	else
+	  {
+	    return c_build_pointer_type (TREE_TYPE (type));
+	  }
+    case FUNCTION_TYPE:
+	return c_build_pointer_type (type);
+    default:
+      break;
+    }
+
+  return type;
+}
+
+tree
+c_generic_type_conversion (tree exp)
+{
+  tree type = default_function_array_type_conversion (exp);
+    /* In ISO C terms, rvalues (including the controlling expression
+     of _Generic) do not have qualified types.  */
+  if (TREE_CODE (type) != ARRAY_TYPE)
+    type = TYPE_MAIN_VARIANT (type);
+  /* In ISO C terms, _Noreturn is not part of the type of expressions
+     such as &abort, but in GCC it is represented internally as a type
+     qualifier.  */
+  if (FUNCTION_POINTER_TYPE_P (type)
+      && TYPE_QUALS (TREE_TYPE (type)) != TYPE_UNQUALIFIED)
+    type = c_build_pointer_type (TYPE_MAIN_VARIANT (TREE_TYPE (type)));
+  return type;
 }
 
 struct c_expr
@@ -3866,11 +3933,39 @@ tree
 build_external_ref (location_t loc, tree id, bool fun, tree *type)
 {
   tree ref;
-  tree decl = lookup_name (id);
+  tree decl;
 
+  decl = lookup_name (id);
   /* In Objective-C, an instance variable (ivar) may be preferred to
      whatever lookup_name() found.  */
   decl = objc_lookup_ivar (decl, id);
+
+  /* for generic association variables (and other fun) we use straight
+     substitution and return the exact value from a faux-declaration here. */
+  {
+    unsigned int ix;
+    c_tree_subst *iter;
+    FOR_EACH_VEC_ELT_REVERSE (c_parser_decl_ref_substitutions, ix, iter)
+      {
+	if (c_tree_equal (DECL_NAME (iter->decl), id)
+	    && c_tree_equal (iter->last_decl, decl))
+	  {
+	    tree sub = DECL_INITIAL (iter->decl);
+	    *type = TREE_TYPE (sub);
+	    decl = sub;
+	    /* substitutions may use l-value indirect reference
+	       expressions instead.  */
+	    if (TREE_CODE (decl) == INDIRECT_REF
+		&& DECL_P (TREE_OPERAND (decl, 0)))
+	      {
+		tree inner_decl = TREE_OPERAND (decl, 0);
+		TREE_USED (inner_decl) = 1;
+		mark_decl_used (inner_decl, false);
+	      }
+	    break;
+	  }
+      }
+  }
 
   *type = NULL;
   if (decl && decl != error_mark_node)

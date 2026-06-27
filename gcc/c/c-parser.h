@@ -110,7 +110,9 @@ enum c_dtr_syn {
      abstract declarators rather than involving redundant parentheses;
      the same applies with attributes inside the parentheses before
      "T".  */
-  C_DTR_PARM
+  C_DTR_PARM,
+  /* Identical behavior to parameters; can be either.  */
+  C_DTR_GENERIC_ASSOC = C_DTR_PARM
 };
 
 /* The binary operation precedence levels, where 0 is a dummy lowest level

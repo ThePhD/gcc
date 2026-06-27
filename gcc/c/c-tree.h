@@ -643,9 +643,16 @@ struct maybe_used_decl
 
 
 /* in c-parser.cc */
+typedef struct c_tree_subst
+{
+  tree last_decl;
+  tree decl;
+} c_tree_subst;
 struct c_tree_token_vec;
 extern void c_parse_init (void);
 extern bool c_keyword_starts_typename (enum rid keyword);
+extern vec<c_tree_subst> c_parser_decl_ref_substitutions;
+
 
 /* in c-aux-info.cc */
 extern void gen_aux_info_record (tree, int, int, int);
@@ -717,7 +724,7 @@ extern struct c_arg_info *get_parm_info (bool, tree);
 extern tree grokfield (location_t, struct c_declarator *,
 		       struct c_declspecs *, tree, tree *, tree *);
 extern tree groktypename (struct c_type_name *, tree *, bool *);
-extern tree grokgenassoc (struct c_type_name *);
+extern tree grokgenassoc (struct c_declarator *, struct c_declspecs *);
 extern tree grokparm (const struct c_parm *, tree *);
 extern tree implicitly_declare (location_t, tree);
 extern void keep_next_level (void);
@@ -739,6 +746,8 @@ extern tree start_enum (location_t, struct c_enum_contents *, tree, tree,
 extern bool start_function (struct c_declspecs *, struct c_declarator *, tree);
 extern tree start_decl (struct c_declarator *, struct c_declspecs *, bool,
 			tree, bool = true, location_t * = NULL);
+extern tree start_decl_with (tree, bool, tree, tree,
+			     bool = true, location_t * = NULL);
 extern tree start_struct (location_t, enum tree_code, tree,
 			  class c_struct_parse_info **);
 extern void store_parm_decls (void);
@@ -862,6 +871,8 @@ extern void c_incomplete_type_error (location_t, const_tree, const_tree);
 extern tree c_type_promotes_to (tree);
 extern struct c_expr default_function_array_conversion (location_t,
 							struct c_expr);
+extern tree default_function_array_type_conversion (tree);
+extern tree c_generic_type_conversion (tree);
 extern struct c_expr default_function_array_read_conversion (location_t,
 							     struct c_expr);
 extern struct c_expr convert_lvalue_to_rvalue (location_t, struct c_expr,

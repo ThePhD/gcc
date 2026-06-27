@@ -226,6 +226,10 @@ const char *
 lhd_decl_printable_name (tree decl, int ARG_UNUSED (verbosity))
 {
   gcc_assert (decl && DECL_NAME (decl));
+  if (DECL_CHAIN (decl) != NULL_TREE
+      && TREE_CODE (DECL_CHAIN (decl)) == IDENTIFIER_NODE
+      && DECL_ARTIFICIAL (decl))
+    return IDENTIFIER_POINTER (DECL_CHAIN (decl));
   return IDENTIFIER_POINTER (DECL_NAME (decl));
 }
 

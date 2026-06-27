@@ -1156,6 +1156,11 @@ extern void c_family_register_lang_features ();
 extern void c_common_register_feature (const char *, bool);
 extern bool has_feature_p (const char *, bool);
 
+extern bool c_substitution_decl_name_p (const_tree);
+extern const char* c_substitution_decl_name (const_tree);
+extern bool c_substitution_source_expr_p (const_tree);
+extern const_tree c_substitution_source_expr (const_tree);
+
 extern bool parse_optimize_options (tree, bool);
 
 /* Positive if an implicit `extern "C"' scope has just been entered;

@@ -5617,25 +5617,28 @@ groktypename (struct c_type_name *type_name, tree *expr,
 }
 
 
-/* Decode a "typename", such as "int **", returning a ..._TYPE node,
-   as for groktypename but setting the context to GENERIC_ASSOC.  */
+/* Decode a typename or declarator, such as "int **", returning a ..._TYPE node,
+   as for groktypename but setting the context to GENERIC_ASSOC. Sets *name to
+   the id if it exists.  */
 
 tree
-grokgenassoc (struct c_type_name *type_name)
+grokgenassoc (struct c_declarator *declarator, struct c_declspecs *specs)
 {
-  tree type;
-  tree attrs = type_name->specs->attrs;
+  tree type_or_var_decl;
+  tree attrs = specs->attrs;
 
-  type_name->specs->attrs = NULL_TREE;
+  specs->attrs = NULL_TREE;
 
-  type = grokdeclarator (type_name->declarator, type_name->specs, GENERIC_ASSOC,
-			 false, NULL, &attrs, NULL, NULL, DEPRECATED_NORMAL);
+  type_or_var_decl = grokdeclarator (declarator, specs, GENERIC_ASSOC, false,
+				     NULL, &attrs, NULL, NULL,
+				     DEPRECATED_NORMAL);
 
   /* Apply attributes.  */
-  attrs = c_warn_type_attributes (type, attrs);
-  decl_attributes (&type, attrs, 0);
+  if (TYPE_P (type_or_var_decl))
+    attrs = c_warn_type_attributes (type_or_var_decl, attrs);
+  decl_attributes (&type_or_var_decl, attrs, 0);
 
-  return type;
+  return type_or_var_decl;
 }
 
 
@@ -5780,8 +5783,6 @@ start_decl (struct c_declarator *declarator, struct c_declspecs *declspecs,
 	    location_t *lastloc /* = NULL */)
 {
   tree decl;
-  tree old_decl;
-  tree tem;
   tree expr = NULL_TREE;
   enum deprecated_states deprecated_state = DEPRECATED_NORMAL;
 
@@ -5800,6 +5801,45 @@ start_decl (struct c_declarator *declarator, struct c_declspecs *declspecs,
 			 deprecated_state);
   if (!decl || decl == error_mark_node)
     return NULL_TREE;
+
+  /* Handle gnu_inline attribute.  */
+  if (declspecs->inline_p
+      && !flag_gnu89_inline
+      && TREE_CODE (decl) == FUNCTION_DECL
+      && (lookup_attribute ("gnu_inline", DECL_ATTRIBUTES (decl))
+	  || current_function_decl))
+    {
+      if (declspecs->storage_class == csc_auto && current_scope != file_scope)
+	;
+      else if (declspecs->storage_class != csc_static)
+	DECL_EXTERNAL (decl) = !DECL_EXTERNAL (decl);
+    }
+
+  return start_decl_with (decl, initialized, attributes, expr, do_push, lastloc);
+}
+
+/* Take a decoded declarator that forms a declaration and get it started.
+   This is called as soon as the type information and variable name
+   have been parsed, before parsing the initializer if any.
+   (if DO_PUSH) is there, we put the DECL put it on the list of decls for the
+   current context. When nonnull, set *LASTLOC to the location of the prior
+   declaration of the same entity if one exists.
+   The ..._DECL node is returned as the value.
+
+   Exception: for arrays where the length is not specified,
+   the type is left null, to be filled in by `finish_decl'.
+
+   Function definitions do not come here; they go to start_function
+   instead.  However, external and forward declarations of functions
+   do go through here.  Structure field declarations are done by
+   grokfield and not through here.  */
+
+tree
+start_decl_with (tree decl, bool initialized, tree attributes, tree expr,
+		 bool do_push /* = true */, location_t *lastloc /* = NULL */)
+{
+  tree old_decl;
+  tree tem;
 
   old_decl = lookup_last_decl (decl);
 
@@ -5900,19 +5940,6 @@ start_decl (struct c_declarator *declarator, struct c_declspecs *declspecs,
 
   /* Set attributes here so if duplicate decl, will have proper attributes.  */
   c_decl_attributes (&decl, attributes, 0);
-
-  /* Handle gnu_inline attribute.  */
-  if (declspecs->inline_p
-      && !flag_gnu89_inline
-      && TREE_CODE (decl) == FUNCTION_DECL
-      && (lookup_attribute ("gnu_inline", DECL_ATTRIBUTES (decl))
-	  || current_function_decl))
-    {
-      if (declspecs->storage_class == csc_auto && current_scope != file_scope)
-	;
-      else if (declspecs->storage_class != csc_static)
-	DECL_EXTERNAL (decl) = !DECL_EXTERNAL (decl);
-    }
 
   if (TREE_CODE (decl) == FUNCTION_DECL
       && DECL_DECLARED_INLINE_P (decl)
@@ -6409,8 +6436,6 @@ grokparm (const struct c_parm *parm, tree *expr)
 
   return decl;
 }
-
-
 
 /* Given a parsed parameter declaration, decode it into a PARM_DECL
    and push that on the current scope.  EXPR is a pointer to an
@@ -7974,7 +7999,7 @@ grokdeclarator (const struct c_declarator *declarator,
   /* If this is a type name (such as, in a cast or sizeof),
      compute the type and return it now.  */
 
-  if (decl_context == TYPENAME || decl_context == GENERIC_ASSOC)
+  if (decl_context == TYPENAME)
     {
       /* Note that the grammar rejects storage classes in typenames
 	 and fields.  */
@@ -8117,6 +8142,74 @@ grokdeclarator (const struct c_declarator *declarator,
 	  pedwarn (loc, 0, "parameter %q+D declared %<inline%>", decl);
 	if (declspecs->noreturn_p)
 	  pedwarn (loc, 0, "parameter %q+D declared %<_Noreturn%>", decl);
+      }
+    else if (decl_context == GENERIC_ASSOC)
+      {
+	/* A parameter declared as an array of T is really a pointer to T.
+	   One declared as a function is really a pointer to a function.  */
+
+	if (TREE_CODE (type) == ARRAY_TYPE)
+	  {
+	    if (!size_error)
+	      *decl_attrs = build_arg_spec_attribute (type, array_parm_static,
+						      *decl_attrs);
+
+	    /* Transfer const-ness of array into that of type pointed to.  */
+	    type = TREE_TYPE (type);
+	    if (orig_qual_type != NULL_TREE)
+	      {
+		if (orig_qual_indirect == 0)
+		  orig_qual_type = TREE_TYPE (orig_qual_type);
+		else
+		  orig_qual_indirect--;
+	      }
+	    if (type_quals)
+	      type = c_build_qualified_type (type, type_quals, orig_qual_type,
+					     orig_qual_indirect);
+
+	    type_quals = array_ptr_quals;
+	    if (type_quals)
+	      type = c_build_qualified_type (type, type_quals);
+
+	    /* We don't yet implement attributes in this context.  */
+	    if (array_ptr_attrs != NULL_TREE)
+	      warning_at (loc, OPT_Wattributes,
+			  "attributes in parameter array declarator ignored");
+
+	    size_varies = false;
+	  }
+	else if (TREE_CODE (type) == FUNCTION_TYPE)
+	  {
+	    if (type_quals & TYPE_QUAL_ATOMIC)
+	      {
+		error_at (loc,
+			  "%<_Atomic%>-qualified function type");
+		type_quals &= ~TYPE_QUAL_ATOMIC;
+	      }
+	    else if (type_quals)
+	      pedwarn (loc, OPT_Wpedantic,
+		       "ISO C forbids qualified function types");
+	    if (type_quals)
+	      type = c_build_qualified_type (type, type_quals);
+	    type_quals = TYPE_UNQUALIFIED;
+	  }
+	else if (type_quals)
+	  type = c_build_qualified_type (type, type_quals);
+
+	decl = build_decl (declarator->id_loc,
+			   VAR_DECL, declarator->u.id.id, type);
+	if (size_varies)
+	  C_DECL_VARIABLE_SIZE (decl) = 1;
+	
+	/* Compute the type actually passed in the parmlist,
+	   for the case where there is no prototype.
+	   (For example, shorts and chars are passed as ints.)
+	   When there is a prototype, this is overridden later.  */
+
+	if (declspecs->inline_p)
+	  error_at (loc, "generic association %q+D declared %<inline%>", decl);
+	if (declspecs->noreturn_p)
+	  error_at (loc, "generic association %q+D declared %<_Noreturn%>", decl);
       }
     else if (decl_context == FIELD)
       {

@@ -87,6 +87,12 @@ along with GCC; see the file COPYING3.  If not see
 
 vec<tree> incomplete_record_decls;
 
+/* This is a collection of declarations -- particularly VAR_DECLs -- that
+   are detected in build_external_ref and substitute their DECL_INITIAL
+   in place of a regular id reference. */
+
+vec<c_tree_subst> c_parser_decl_ref_substitutions;
+
 void
 set_c_expr_source_range (c_expr *expr,
 			 location_t start, location_t finish)
@@ -328,6 +334,144 @@ c_parser_set_error (c_parser *parser, bool err)
    garbage-collected?  */
 
 static GTY (()) c_parser *the_parser;
+
+bool
+c_parser_consume_balanced_token_sequence_to (c_parser *parser,
+					     auto_vec<c_token> *tokens,
+					     enum cpp_ttype *stopped_at,
+					     bool *stopped,
+					     location_t *stop_loc,
+					     unsigned int n_stops,
+					     const enum cpp_ttype stops [],
+					     bool include_stop = false,
+					     bool eof_okay = false,
+					     bool add_eof = true)
+{
+  gcc_assert(n_stops > 0);
+  gcc_assert(stops != NULL);
+  bool result = true;
+  HOST_WIDE_INT squares = 0;
+  HOST_WIDE_INT parens = 0;
+  HOST_WIDE_INT curlies = 0;
+  while (1)
+    {
+      c_token *tok = c_parser_peek_token (parser);
+      if (tok == NULL)
+	break;
+      if (tok->type == CPP_EOF)
+	{
+	  if (parens != 0 || squares != 0 || curlies != 0)
+	    {
+	      c_parser_error(parser, "unexpected EOF before end of "
+			     "balanced token sequence");
+	      if (tokens->length () != 0)
+		inform ((*tokens)[0].location, "balanced token sequence "
+			"started from here");
+	    }
+	  else if (!eof_okay)
+	    c_parser_error(parser, "unexpected EOF");
+	  break;
+	}
+      bool is_stop = false;
+      for (const enum cpp_ttype *stop = stops, *last_stop = (stops + n_stops);
+	   stop != last_stop && !is_stop; ++stop)
+	{
+	  is_stop = *stop == tok->type;
+	  if (is_stop && stopped_at != NULL)
+	    *stopped_at = *stop;
+	}
+      if (is_stop && squares == 0 && parens == 0 && curlies == 0)
+	{
+	  if (include_stop)
+	    tokens->safe_push (*tok);
+	  if (stopped != NULL)
+	    *stopped = true;
+	  if (stop_loc != NULL)
+	    *stop_loc = tok->location;
+	  break;
+	}
+      switch (tok->type)
+	{
+	  case CPP_OPEN_BRACE:
+	    if (curlies == HOST_WIDE_INT_MAX)
+	      {
+		sorry_at (tok->location, "unsupported number of braces in "
+			  "balanced token sequence");
+		result = false;
+		goto out;
+	      }
+	    ++curlies;
+	    break;
+	  case CPP_OPEN_PAREN:
+	    if (parens == HOST_WIDE_INT_MAX)
+	      {
+		sorry_at (tok->location, "unsupported number of parentheses "
+			  "in balanced token sequence");
+		result = false;
+		goto out;
+	      }
+	    ++parens;
+	    break;
+	  case CPP_OPEN_SQUARE:
+	    if (squares == HOST_WIDE_INT_MAX)
+	      {
+		sorry_at (tok->location, "unsupported number of square brackets "
+			  "in balanced token sequence");
+		result = false;
+		goto out;
+	      }
+	    ++squares;
+	    break;
+	  case CPP_CLOSE_BRACE:
+	    if (curlies == 0)
+	      {
+		error_at (tok->location, "unbalanced number of braces in "
+			  "balanced token sequence");
+		result = false;
+		goto out;
+	      }
+	    --curlies;
+	    break;
+	  case CPP_CLOSE_PAREN:
+	    if (parens == 0)
+	      {
+		error_at (tok->location, "unbalanced number of parentheses "
+			  "in balanced token sequence");
+		result = false;
+		goto out;
+	      }
+	    --parens;
+	    break;
+	  case CPP_CLOSE_SQUARE:
+	    if (squares == 0)
+	      {
+		error_at (tok->location, "unbalanced number of square "
+			  "brackets in balanced token sequence");
+		result = false;
+		goto out;
+	      }
+	    --squares;
+	    break;
+	  default:
+	    break;
+	}
+      tokens->safe_push (*tok);
+      c_parser_consume_token (parser);
+    }
+out:
+  if (add_eof)
+    {
+      c_token tok = {};
+      tok.type = CPP_EOF;
+      tok.keyword = RID_MAX;
+      tok.location = tokens->length () > 0
+		     ? tokens->last ().location : UNKNOWN_LOCATION;
+      /* add a few, just incase of peeks.  */
+      tokens->safe_push (tok);
+      tokens->safe_push (tok);
+    }
+  return result;
+}
 
 /* Read in and lex a single token, storing it in *TOKEN.  If RAW,
    context-sensitive postprocessing of the token is not done.  */
@@ -11321,52 +11465,447 @@ c_parser_get_builtin_args (c_parser *parser, const char *bname,
 }
 
 /* This represents a single generic-association.  */
-
 struct c_generic_association
 {
   /* The location of the starting token of the type.  */
-  location_t type_location;
+  location_t assoc_location;
+  /* The location of the comma or parenthesis ending the association.  */
+  location_t colon_location;
+  /* The location of the comma or parenthesis ending the association.  */
+  location_t end_location;
   /* The association's type, or NULL_TREE for 'default'.  */
   tree type;
+  /* The association's declaration, or NULL_TREE with no C2y declaration.  */
+  tree decl;
+  /* The association's unparsed expression tokens.  */
+  auto_vec<c_token> *tokens;
+  /* The start index of the unparsed expression tokens.  */
+  unsigned long tokens_start;
+  /* The number of unparsed expression tokens, including any EOF.  */
+  unsigned long tokens_avail;
   /* The association's expression.  */
   struct c_expr expression;
 };
+typedef struct c_generic_association c_generic_association;
+
+/* Small reusable routine to simply mark all generic associations in a generic
+   as used. Should be called if at least one match is found. */
+
+static void
+mark_associations_read (auto_vec<c_generic_association> *associations,
+			int match_found)
+{
+  unsigned int ix;
+  struct c_generic_association *iter;
+  FOR_EACH_VEC_ELT (*associations, ix, iter)
+    if (ix != (unsigned) match_found)
+      mark_exp_read (iter->expression.value);
+}
+
+/* Creates (and pushes) all of the necessary intermediate declarations and
+   actions for a generic association declaration. *DECL is modified
+   with to have its DECL_INITIAL point to a direct substitution done
+   in build_external_ref. INIT_TYPE and INIT are the type and expression
+   associated with a a generic association selector. MATCH is whether or
+   not the generic association here is a successful match.  */
+
+static tree
+push_genassoc_decl (location_t decl_loc, tree *decl,
+		    location_t init_loc, tree init, bool match)
+{
+  tree rename_decl = NULL_TREE;
+  tree init_type = init ? TREE_TYPE (init) : TREE_TYPE (*decl);
+  tree target_type = match ? init_type : TREE_TYPE (*decl);
+  const bool init_is_lvalue = lvalue_p (init);
+  tree decl_name = DECL_NAME (*decl);
+
+  TREE_TYPE (*decl) = target_type;
+
+  const char *original_decl_label = IDENTIFIER_POINTER (decl_name);
+  if (init_is_lvalue)
+    {
+      char *selector_label
+	= concat ("__gaa_", original_decl_label, NULL);
+      tree init_addr_id = generate_internal_label (selector_label);
+      free (selector_label);
+      tree init_addr_type = c_build_pointer_type (target_type);
+      tree init_addr_decl
+	= build_decl (init_loc, VAR_DECL, init_addr_id, init_addr_type);
+      init_addr_decl = start_decl_with (init_addr_decl, match,
+					DECL_ATTRIBUTES (*decl),
+					NULL_TREE, true, NULL);
+      tree init_to_addr = match
+			  ? build_unary_op (init_loc, ADDR_EXPR, init, false)
+			  : NULL_TREE;
+      finish_decl (init_addr_decl, init_loc, init_to_addr,
+		   init_addr_type, NULL_TREE);
+      rename_decl = init_addr_decl;
+
+      tree backing_deref = build_indirect_ref (decl_loc, init_addr_decl,
+					       RO_UNARY_STAR);
+      DECL_INITIAL (*decl) = backing_deref;
+    }
+  else
+    {
+      char *backing_label
+	= concat ("__gav_", original_decl_label, NULL);
+      tree backing_name = generate_internal_label (backing_label);
+      free (backing_label);
+
+      tree backing_decl = build_decl (init_loc, VAR_DECL, backing_name,
+				      target_type);
+      backing_decl = start_decl_with (backing_decl, match,
+				      DECL_ATTRIBUTES (*decl),
+				      NULL_TREE, true, NULL);
+      finish_decl (backing_decl, init_loc, match ? init : NULL_TREE,
+		   target_type, NULL_TREE);
+      rename_decl = backing_decl;
+
+      DECL_INITIAL (*decl) = backing_decl;
+    }
+
+  /* make id decl chain, so error reporting gives the right
+     variable name.  */
+  DECL_CHAIN (rename_decl) = decl_name;
+  DECL_IGNORED_P (rename_decl) = 1;
+  DECL_ARTIFICIAL (rename_decl) = 1;
+  if (match)
+    mark_exp_read (init);
+  return *decl;
+}
+
+/* Parse a generic-association type-name or a
+   generic-association declaration.  */
+
+static tree
+c_parser_generic_association_type_decl (c_parser *parser, bool *seen_id)
+{
+  struct c_declarator *gendecl = NULL;
+  struct c_declspecs *genspecs = build_null_declspecs ();
+  c_parser_declspecs (parser, genspecs, false, true, false,
+		      false, false, true, true, cla_prefer_type);
+  if (!genspecs->declspecs_seen_p)
+    {
+      c_parser_error (parser, "expected specifier-qualifier-list");
+      return NULL_TREE;
+    }
+  if (genspecs->storage_class != csc_none)
+    {
+      c_parser_error (parser, "generic associations types and declarations "
+			      "may not have storage classes");
+      return NULL_TREE;
+    }
+  if (genspecs->type != error_mark_node)
+    {
+      pending_xref_error ();
+    }
+  else
+    {
+      c_parser_error (parser, "could not parse a type name or "
+			      "generic association declaration");
+      return NULL_TREE;
+    }
+  genspecs = finish_declspecs (genspecs);
+  if (genspecs == NULL || parser->error)
+    {
+      c_parser_error (parser, "could not parse a type name or "
+			      "generic association declaration");
+      return NULL_TREE;
+    }
+  gendecl = c_parser_declarator (parser, false, C_DTR_GENERIC_ASSOC, seen_id);
+  if (gendecl == NULL || parser->error)
+    {
+      c_parser_error (parser, "could not parse a type name or "
+			      "generic association declaration");
+      return NULL_TREE;
+    }
+  tree assoc_decl_or_type = grokgenassoc (gendecl, genspecs);
+  if (assoc_decl_or_type == error_mark_node
+      || assoc_decl_or_type == NULL_TREE)
+    {
+      return NULL_TREE;
+    }
+  return assoc_decl_or_type;
+}
+
+/* Parse a generic-assocation (C11 6.5.1.1).
+
+   generic-association:
+     type-name : assignment-expression
+     generic-declaration-name : assignment-expression 
+     default identifier[opt] : assignment-expression
+
+   (The use of an identifier / generic-declaration-name is new in C2Y.)
+
+   generic-declaration-name:
+    generic-declaration-specifiers declarator
+
+   generic-declaration-specifier:
+     type-specifier-qualifier
+
+   generic-declaration-specifiers:
+     generic-declaration-specifier attribute-specifier-sequence[opt]
+     generic-declaration-specifier generic-declaration-specifiers
+
+*/
+
+static bool
+c_parser_generic_association_start (c_parser *parser, location_t selector_loc,
+				    tree selector_type, bool selector_expr_p,
+				    bool *comma_found,
+				    c_generic_association *assoc)
+{
+  c_token *token = c_parser_peek_token (parser);
+  assoc->assoc_location = token->location;
+  if (token->type == CPP_KEYWORD && token->keyword == RID_DEFAULT)
+    {
+      c_parser_consume_token (parser);
+      c_token *token = c_parser_peek_token (parser);
+      if (token->type == CPP_NAME)
+	{
+	  /* name; build a variable decl for the input type. */
+	  tree id = c_parser_peek_token (parser)->value;
+	  assoc->decl = build_decl (assoc->assoc_location, VAR_DECL, id,
+				    selector_type);
+	  DECL_INITIAL (assoc->decl) = error_mark_node;
+	  c_parser_consume_token (parser);
+	  pedwarn_c23 (assoc->assoc_location, OPT_Wpedantic,
+		       "ISO C does not support default generic association "
+		       "declarations before C2Y");
+	}
+      assoc->type = NULL;
+    }
+  else
+    {
+      bool seen_id = false;
+      tree assoc_decl_or_type
+	= c_parser_generic_association_type_decl (parser, &seen_id);
+      if (assoc_decl_or_type == error_mark_node || assoc_decl_or_type == NULL_TREE)
+	{
+	  c_parser_skip_until_found (parser, CPP_CLOSE_PAREN, NULL);
+	  return false;
+	}
+      const bool is_var_decl = TREE_CODE (assoc_decl_or_type) == VAR_DECL;
+      const bool is_type = TYPE_P (assoc_decl_or_type);
+      if (seen_id)
+	{
+	  if (!is_var_decl)
+	    {
+	      error_at (assoc->assoc_location,
+			"the generic association must have either a "
+			"type name or a generic association declaration");
+	      c_parser_skip_until_found (parser, CPP_CLOSE_PAREN, NULL);
+	      return false;
+	    }
+	  if (!selector_expr_p)
+	    {
+	      error_at (assoc->assoc_location,
+			"%<_Generic%> with a type name cannot be used "
+			"with a generic association declaration");
+	      inform (selector_loc, "type name here");
+	      c_parser_skip_until_found (parser, CPP_CLOSE_PAREN, NULL);
+	      return false;
+	    }
+	  pedwarn_c23 (assoc->assoc_location, OPT_Wpedantic,
+		       "ISO C does not support generic association "
+		       "declarations before C2Y");
+	  assoc->decl = start_decl_with (assoc_decl_or_type, true,
+					 NULL_TREE, NULL_TREE, false,
+					 NULL);
+	  assoc->type = TREE_TYPE (assoc->decl);
+	}
+      else
+	{
+	  if ((is_var_decl && DECL_NAME (assoc_decl_or_type) != NULL_TREE)
+	      || (!is_var_decl && !is_type))
+	    {
+	      /* this is a VAR_DECL that has name -- it's a
+		 type, but it happened to fall into build_id_declarator
+		 **without** giving it a NULL_TREE name or something
+		 similar. That, or it's neither a VAR_DECL or TYPE.  */
+	      error_at (assoc->assoc_location,
+			"the generic association must have either a "
+			"type name or a declaration");
+	      c_parser_skip_until_found (parser, CPP_CLOSE_PAREN, NULL);
+	      return false;
+	    }
+	  if (is_var_decl)
+	    assoc->type = TREE_TYPE (assoc_decl_or_type);
+	  else
+	    assoc->type = assoc_decl_or_type;
+	}
+      gcc_assert(assoc->type != NULL_TREE);
+      if (TREE_CODE (assoc->type) == FUNCTION_TYPE)
+	pedwarn_c23 (assoc->assoc_location, OPT_Wpedantic,
+		 "ISO C does not support %<_Generic%> association "
+		 "with function type before C2Y");
+      else if (!COMPLETE_TYPE_P (assoc->type))
+	pedwarn_c23 (assoc->assoc_location, OPT_Wpedantic,
+		 "ISO C does not support %<_Generic%> association "
+		 "with incomplete type before C2Y");
+
+      if (c_type_variably_modified_p (assoc->type))
+	pedwarn_c23 (assoc->assoc_location, OPT_Wpedantic,
+		 "ISO C does not support %<_Generic%> association "
+		 "with variably-modified type before C2Y");
+    }
+  assoc->colon_location = c_parser_peek_token (parser)->location;
+  if (!c_parser_require (parser, CPP_COLON, "expected %<:%>"))
+    {
+      c_parser_skip_until_found (parser, CPP_CLOSE_PAREN, NULL);
+      return false;
+    }
+  /* just get token slurry; parse it later after we have all types with
+     c_parser_generic_association (...).  */
+  enum cpp_ttype stops[2] = { CPP_COMMA, CPP_CLOSE_PAREN };
+  enum cpp_ttype stopped_at = CPP_EOF;
+  bool stopped = false;
+  assoc->tokens_start = assoc->tokens->length ();
+  bool consumed_successfully
+    = c_parser_consume_balanced_token_sequence_to (parser,
+						   assoc->tokens,
+						   &stopped_at, &stopped,
+						   &assoc->end_location,
+						   2, stops);
+  assoc->tokens_avail = assoc->tokens->length () - assoc->tokens_start;
+  if (!consumed_successfully || parser->error)
+    {
+      c_parser_skip_until_found (parser, CPP_CLOSE_PAREN, NULL);
+      return false;
+    }
+  if (assoc->tokens_avail == 0)
+    {
+      error_at (assoc->colon_location, "expected expression after %<:%>");
+      c_parser_skip_until_found (parser, CPP_CLOSE_PAREN, NULL);
+      return false;
+    }
+  if (stopped && stopped_at == CPP_COMMA)
+    {
+      /* consume commas, but not parentheses.  */
+      if (comma_found != NULL)
+	*comma_found = true;
+      c_parser_consume_token (parser);
+    }
+  return true;
+}
+
+static bool
+c_parser_generic_association (c_parser *parser, location_t selector_loc,
+			      struct c_expr selector, bool match,
+			      struct maybe_used_decl **maybe_used_default,
+			      c_generic_association *assoc)
+{
+  bool using_decl = assoc->decl != NULL_TREE;
+  tree decl_sub = NULL_TREE;
+  if (using_decl)
+    {
+      /* if a match, make sure and we have a named decl. */
+      decl_sub = push_genassoc_decl (assoc->assoc_location, &assoc->decl,
+				     selector_loc, selector.value, match);
+      if (decl_sub != NULL_TREE)
+	{
+	  tree old_decl = lookup_name (DECL_NAME (decl_sub));
+	  c_tree_subst substitution = { old_decl, decl_sub };
+	  c_parser_decl_ref_substitutions.safe_push (substitution);
+	}
+    }
+
+  if (!match || assoc->type != NULL_TREE)
+    c_inhibit_evaluation_warnings++;
+  in_generic++;
+
+  c_token *save_tokens = parser->tokens;
+  unsigned int save_tokens_avail = parser->tokens_avail;
+  parser->tokens = assoc->tokens->address () + assoc->tokens_start;
+  parser->tokens_avail = assoc->tokens_avail;
+
+  assoc->expression = c_parser_expr_no_commas (parser, NULL);
+
+  parser->tokens = save_tokens;
+  parser->tokens_avail = save_tokens_avail;
+
+  if (decl_sub != NULL_TREE)
+    {
+      gcc_assert (c_parser_decl_ref_substitutions.last ().decl == decl_sub);
+      c_parser_decl_ref_substitutions.pop ();
+    }
+
+  if (!match || assoc->type != NULL_TREE)
+    c_inhibit_evaluation_warnings--;
+  in_generic--;
+  if (!match)
+    pop_maybe_used (!flag_isoc23);
+  else if (assoc->type == NULL_TREE)
+    *maybe_used_default = save_maybe_used ();
+  else
+    pop_maybe_used (true);
+
+  gcc_assert(assoc->expression.value != NULL_TREE);
+  if (assoc->expression.value == error_mark_node)
+    {
+      return false;
+    }
+
+  return true;
+}
+
+static int
+find_generic_match (int match_found, tree selector_type,
+		    int ix, c_generic_association *iter,
+		    auto_vec<c_generic_association> *associations)
+{
+  if (match_found < 0)
+    {
+      if (iter->type == NULL_TREE || comptypes (selector_type, iter->type))
+	{
+	  match_found = ix;
+	}
+    }
+  else if (iter->type != NULL_TREE && comptypes (selector_type, iter->type))
+    {
+      c_generic_association *match = associations->address () + match_found;
+      if (match->type != NULL_TREE)
+	{
+	  error_at (iter->assoc_location,
+		    "%<_Generic%> selector with type %qT matches "
+		    "multiple associations", selector_type);
+	  inform (match->assoc_location, "other match is here");
+	}
+      else
+	match_found = ix; /* override `default` case.  */
+    }
+  return match_found;
+}
 
 /* Parse a generic-selection.  (C11 6.5.1.1).
 
    generic-selection:
      _Generic ( generic-controlling-operand , generic-assoc-list )
 
-  generic-controlling-operand:
-    assignment-expression
-    type-name
+   generic-controlling-operand:
+     assignment-expression
+     type-name
 
-  (The use of a type-name is new in C2Y.)
+   (The use of a type-name is new in C2Y.)
 
    generic-assoc-list:
      generic-association
      generic-assoc-list , generic-association
 
-   generic-association:
-     type-name : assignment-expression
-     default : assignment-expression
 */
 
 static struct c_expr
 c_parser_generic_selection (c_parser *parser)
 {
   struct c_expr selector, error_expr;
-  tree selector_type;
-  struct c_generic_association matched_assoc;
+  tree selector_type, lvalue_selector_type;
   int match_found = -1;
   location_t generic_loc, selector_loc;
 
+  selector.value = NULL_TREE;
   error_expr.original_code = ERROR_MARK;
   error_expr.original_type = NULL;
   error_expr.set_error ();
-  matched_assoc.type_location = UNKNOWN_LOCATION;
-  matched_assoc.type = NULL_TREE;
-  matched_assoc.expression = error_expr;
 
   gcc_assert (c_parser_next_token_is_keyword (parser, RID_GENERIC));
   generic_loc = c_parser_peek_token (parser)->location;
@@ -11404,7 +11943,6 @@ c_parser_generic_selection (c_parser *parser)
       c_inhibit_evaluation_warnings++;
       in_generic++;
       selector = c_parser_expr_no_commas (parser, NULL);
-      selector = default_function_array_conversion (selector_loc, selector);
       c_inhibit_evaluation_warnings--;
       in_generic--;
       pop_maybe_used (!flag_isoc23);
@@ -11414,21 +11952,9 @@ c_parser_generic_selection (c_parser *parser)
 	  c_parser_skip_until_found (parser, CPP_CLOSE_PAREN, NULL);
 	  return selector;
 	}
-      mark_exp_read (selector.value);
       selector_type = TREE_TYPE (selector.value);
-      /* In ISO C terms, rvalues (including the controlling expression
-	 of _Generic) do not have qualified types.  */
-      if (TREE_CODE (selector_type) != ARRAY_TYPE)
-	selector_type = TYPE_MAIN_VARIANT (selector_type);
-      /* In ISO C terms, _Noreturn is not part of the type of expressions
-	 such as &abort, but in GCC it is represented internally as a type
-	 qualifier.  */
-      if (FUNCTION_POINTER_TYPE_P (selector_type)
-	  && TYPE_QUALS (TREE_TYPE (selector_type)) != TYPE_UNQUALIFIED)
-	selector_type
-	  = c_build_pointer_type (TYPE_MAIN_VARIANT (TREE_TYPE (selector_type)));
     }
-
+  lvalue_selector_type = c_generic_type_conversion (selector_type);
   if (!c_parser_require (parser, CPP_COMMA, "expected %<,%>"))
     {
       c_parser_skip_until_found (parser, CPP_CLOSE_PAREN, NULL);
@@ -11436,136 +11962,100 @@ c_parser_generic_selection (c_parser *parser)
     }
 
   auto_vec<c_generic_association> associations;
-  struct maybe_used_decl *maybe_used_default = NULL;
+  auto_vec<c_token> tokens;
   while (1)
     {
-      struct c_generic_association assoc, *iter;
-      unsigned int ix;
-      c_token *token = c_parser_peek_token (parser);
-
-      assoc.type_location = token->location;
-      if (token->type == CPP_KEYWORD && token->keyword == RID_DEFAULT)
+      c_generic_association assoc
+	= { UNKNOWN_LOCATION, UNKNOWN_LOCATION, UNKNOWN_LOCATION,
+	    NULL_TREE, NULL_TREE, &tokens, 0, 0, error_expr };
+      bool comma_found = false;
+      bool type_and_tokens_read
+	= c_parser_generic_association_start (parser, selector_loc,
+					      selector_type,
+					      selector.value != NULL_TREE,
+					      &comma_found, &assoc);
+      if (!type_and_tokens_read)
 	{
-	  c_parser_consume_token (parser);
-	  assoc.type = NULL_TREE;
-	}
-      else
-	{
-	  struct c_type_name *type_name;
-
-	  type_name = c_parser_type_name (parser);
-	  if (type_name == NULL)
-	    {
-	      c_parser_skip_until_found (parser, CPP_CLOSE_PAREN, NULL);
-	      return error_expr;
-	    }
-	  assoc.type = grokgenassoc (type_name);
-	  if (assoc.type == error_mark_node)
-	    {
-	      c_parser_skip_until_found (parser, CPP_CLOSE_PAREN, NULL);
-	      return error_expr;
-	    }
-
-	  if (TREE_CODE (assoc.type) == FUNCTION_TYPE)
-	    pedwarn_c23 (assoc.type_location, OPT_Wpedantic,
-			 "ISO C does not support %<_Generic%> association with "
-			 "function type before C2Y");
-	  else if (!COMPLETE_TYPE_P (assoc.type))
-	    pedwarn_c23 (assoc.type_location, OPT_Wpedantic,
-			 "ISO C does not support %<_Generic%> association with "
-			 "incomplete type before C2Y");
-
-	  if (c_type_variably_modified_p (assoc.type))
-	    pedwarn_c23 (assoc.type_location, OPT_Wpedantic,
-			 "ISO C does not support %<_Generic%> association with "
-			 "variably-modified type before C2Y");
-	}
-
-      if (!c_parser_require (parser, CPP_COLON, "expected %<:%>"))
-	{
-	  c_parser_skip_until_found (parser, CPP_CLOSE_PAREN, NULL);
 	  return error_expr;
 	}
+      associations.safe_push (assoc);
+      if (!comma_found)
+	break;
+    }
 
-      bool match = assoc.type == NULL_TREE
-		   || comptypes (assoc.type, selector_type);
+  /* we have all of the association types: find the match and only parse
+     when we're good and ready. */
 
-      if (!match || matched_assoc.type != NULL_TREE)
-	c_inhibit_evaluation_warnings++;
-      in_generic++;
-
-      assoc.expression = c_parser_expr_no_commas (parser, NULL);
-
-      if (!match || matched_assoc.type != NULL_TREE)
-	c_inhibit_evaluation_warnings--;
-      in_generic--;
-      if (!match)
-	pop_maybe_used (!flag_isoc23);
-      else if (assoc.type == NULL_TREE)
-	maybe_used_default = save_maybe_used ();
-      else
-	pop_maybe_used (true);
-
-      if (assoc.expression.value == error_mark_node)
+  unsigned int ix = 0;
+  c_generic_association *iter = NULL;
+  FOR_EACH_VEC_ELT(associations, ix, iter)
+    {
+      unsigned int inner_ix = 0;
+      c_generic_association *inner_iter = NULL;
+      FOR_EACH_VEC_ELT(associations, inner_ix, inner_iter)
 	{
-	  c_parser_skip_until_found (parser, CPP_CLOSE_PAREN, NULL);
-	  return error_expr;
-	}
-
-      for (ix = 0; associations.iterate (ix, &iter); ++ix)
-	{
-	  if (assoc.type == NULL_TREE)
+	  if (inner_iter == iter)
+	    continue;
+	  if (iter->type == NULL_TREE)
 	    {
-	      if (iter->type == NULL_TREE)
+	      if (inner_iter->type == NULL_TREE)
 		{
-		  error_at (assoc.type_location,
-			    "duplicate %<default%> case in %<_Generic%>");
-		  inform (iter->type_location, "original %<default%> is here");
+		  error_at (inner_iter->assoc_location,
+			"duplicate %<default%> case in %<_Generic%>");
+		  inform (iter->assoc_location,
+			  "original %<default%> is here");
 		}
 	    }
 	  else if (iter->type != NULL_TREE)
 	    {
-	      if (comptypes (assoc.type, iter->type))
+	      if (comptypes (iter->type, inner_iter->type))
 		{
-		  error_at (assoc.type_location,
-			    "%<_Generic%> specifies two compatible types");
-		  inform (iter->type_location, "compatible type is here");
+		  error_at (iter->assoc_location,
+			"%<_Generic%> specifies two compatible types "
+			"%qT and %qT", inner_iter->type, iter->type);
+		  inform (inner_iter->assoc_location,
+			  "compatible type is here");
 		}
 	    }
 	}
-
-      if (assoc.type == NULL_TREE)
-	{
-	  if (match_found < 0)
-	    {
-	      matched_assoc = assoc;
-	      match_found = associations.length ();
-	    }
-	}
-      else if (match)
-	{
-	  if (match_found < 0 || matched_assoc.type == NULL_TREE)
-	    {
-	      matched_assoc = assoc;
-	      match_found = associations.length ();
-	    }
-	  else
-	    {
-	      error_at (assoc.type_location,
-			"%<_Generic%> selector matches multiple associations");
-	      inform (matched_assoc.type_location,
-		      "other match is here");
-	    }
-	}
-
-      associations.safe_push (assoc);
-
-      if (c_parser_peek_token (parser)->type != CPP_COMMA)
-	break;
-      c_parser_consume_token (parser);
+      match_found = find_generic_match (match_found, selector_type,
+					ix, iter, &associations);
     }
 
-  if (match_found >= 0 && matched_assoc.type == NULL_TREE)
+  if (match_found < 0)
+    {
+      /* try to find a matching type but this time 
+	 after lvalue conversion on the selector type.  */
+      FOR_EACH_VEC_ELT(associations, ix, iter)
+	{
+	  match_found = find_generic_match (match_found, lvalue_selector_type,
+					    ix, iter, &associations);
+	}
+      if (match_found < 0)
+	{
+	  error_at (selector_loc, "%<_Generic%> selector of type %qT is not "
+		    "compatible with any association",
+		    selector_type);
+	  return error_expr;
+	}
+    }
+
+  struct maybe_used_decl *maybe_used_default = NULL;
+  FOR_EACH_VEC_ELT(associations, ix, iter)
+    {
+      bool parsed_successfully
+	= c_parser_generic_association (parser, selector_loc, selector,
+					match_found >= 0, &maybe_used_default,
+					iter);
+      if (!parsed_successfully)
+	{
+	  c_parser_skip_until_found (parser, CPP_CLOSE_PAREN, NULL);
+	  return error_expr;
+	}
+    }
+
+
+  if (match_found >= 0 && associations[match_found].type == NULL_TREE)
     {
       /* Declarations referenced in the default association are used.  */
       restore_maybe_used (maybe_used_default);
@@ -11579,27 +12069,14 @@ c_parser_generic_selection (c_parser *parser)
       pop_maybe_used (!flag_isoc23);
     }
 
-  unsigned int ix;
-  struct c_generic_association *iter;
-  FOR_EACH_VEC_ELT (associations, ix, iter)
-    if (ix != (unsigned) match_found)
-      mark_exp_read (iter->expression.value);
-
   if (!parens.require_close (parser))
     {
       c_parser_skip_until_found (parser, CPP_CLOSE_PAREN, NULL);
       return error_expr;
     }
 
-  if (match_found < 0)
-    {
-      error_at (selector_loc, "%<_Generic%> selector of type %qT is not "
-		"compatible with any association",
-		selector_type);
-      return error_expr;
-    }
-
-  return matched_assoc.expression;
+  mark_associations_read (&associations, match_found);
+  return associations[match_found].expression;
 }
 
 /* Check the validity of a function pointer argument *EXPR (argument

@@ -1915,6 +1915,20 @@ readonly_error (location_t loc, tree arg, enum lvalue_use use)
 				 G_("decrement of read-only location %qE"),
 				 G_("read-only location %qE used as %<asm%> output")),
 	      arg);
+  
+  if (c_substitution_source_expr_p (arg))
+    {
+      const_tree source_expr = c_substitution_source_expr (arg);
+      if (source_expr != NULL_TREE)
+	{
+	  location_t source_expr_loc
+	    = DECL_P (source_expr)
+	      ? DECL_SOURCE_LOCATION (source_expr)
+	      : EXPR_LOC_OR_LOC (source_expr, loc);
+	  if (source_expr_loc != loc)
+	    inform (source_expr_loc, "with expression sourced from here");
+	}
+    }
 }
 
 /* Print an error message for an invalid lvalue.  USE says

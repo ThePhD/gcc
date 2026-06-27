@@ -2209,7 +2209,9 @@ c_pretty_printer::unary_expression (tree e)
 	  tree type = TREE_TYPE (TREE_OPERAND (e, 0));
 	  if (type && TREE_CODE (type) == REFERENCE_TYPE)
 	    /* Reference decay is implicit, don't print anything.  */;
-	  else
+	  else if (!c_substitution_decl_name_p (TREE_OPERAND (e, 0)))
+	    /* Alternative replacement decls use derefs for l-values:
+	       no star allowed for the deref-to-get-address-lvalue.  */
 	    pp_c_star (this);
 	}
       else if (code == NEGATE_EXPR)
@@ -3026,7 +3028,7 @@ pp_c_tree_decl_identifier (c_pretty_printer *pp, tree t)
   if (DECL_NAME (t))
     {
       const char *dot;
-      name = IDENTIFIER_POINTER (DECL_NAME (t));
+      name = c_substitution_decl_name (t);
       if (DECL_ARTIFICIAL (t) && (dot = strchr (name, '.')))
 	{
 	  /* Print the name without the . suffix (such as in VLAs and

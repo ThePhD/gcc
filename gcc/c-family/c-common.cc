@@ -10752,6 +10752,76 @@ has_feature_p (const char *ident, bool strict_p)
   return !strict_p || *feat_p;
 }
 
+/* For certain declarations, the chain stores an alternative name. Check
+   if this is likely the case or not for DECL.  */
+
+bool
+c_substitution_decl_name_p (const_tree decl)
+{
+  if (decl == NULL_TREE)
+    return false;
+  if (DECL_P (decl) && DECL_CHAIN (decl) != NULL_TREE
+      && TREE_CODE (DECL_CHAIN (decl)) == IDENTIFIER_NODE
+      && DECL_ARTIFICIAL (decl))
+    return true;
+  return false;
+}
+
+/* For certain declarations, the chain stores an alternative name. Get
+   the name of that identifier from DECL.  */
+
+const char*
+c_substitution_decl_name (const_tree decl)
+{
+  if (decl == NULL_TREE || !DECL_P (decl))
+    return NULL;
+  if (c_substitution_decl_name_p (decl))
+    return IDENTIFIER_POINTER (DECL_CHAIN (decl));
+  if (DECL_NAME (decl) != NULL_TREE)
+    return IDENTIFIER_POINTER (DECL_NAME (decl));
+  return NULL;
+}
+
+bool
+c_substitution_source_expr_p (const_tree exp)
+{
+  if (exp == NULL_TREE)
+    return false;
+  if (TREE_CODE (exp) == INDIRECT_REF)
+    /* lvalue initializer part 1: deref of address temporary.  */
+    exp = TREE_OPERAND (exp, 0);
+  /* Check if this is a proper substitution declaration.  */
+  if (!c_substitution_decl_name_p (exp))
+    return false;
+  exp = DECL_INITIAL (exp);
+  if (exp == NULL_TREE || exp == error_mark_node)
+    return false;
+  //if (TREE_CODE (exp) == ADDR_EXPR)
+    /* lvalue initializer part 2: address temporary with intial expression.  */
+    //exp = TREE_OPERAND (exp, 0);
+  return exp != NULL_TREE && exp != error_mark_node;
+}
+
+const_tree
+c_substitution_source_expr (const_tree exp)
+{
+  if (exp == NULL_TREE)
+    return NULL_TREE;
+  if (TREE_CODE (exp) == INDIRECT_REF)
+    /* lvalue initializer part 1: deref of address temporary.  */
+    exp = TREE_OPERAND (exp, 0);
+  if (!c_substitution_decl_name_p (exp))
+    return NULL_TREE;
+  exp = DECL_INITIAL (exp);
+  if (exp == NULL_TREE || exp == error_mark_node)
+    return NULL_TREE;
+  //if (TREE_CODE (exp) == ADDR_EXPR)
+    /* lvalue initializer part 2: address temporary with intial expression.  */
+    //exp = TREE_OPERAND (exp, 0);
+  return exp;
+}
+
+
 /* This is the slow path of c-common.h's c_hardbool_type_attr.  */
 
 tree
