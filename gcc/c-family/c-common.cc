@@ -394,6 +394,7 @@ static bool nonnull_check_p (tree, unsigned HOST_WIDE_INT);
 */
 const struct c_common_resword c_common_reswords[] =
 {
+  { "_Alias",		RID_ALIAS,     D_CONLY },
   { "_Alignas",		RID_ALIGNAS,   D_CONLY },
   { "_Alignof",		RID_ALIGNOF,   D_CONLY },
   { "_Countof",		RID_COUNTOF,   D_CONLY },

@@ -3855,6 +3855,30 @@ mark_decl_used (tree ref, bool address)
     }
 }
 
+static void
+ref_alias_decl_warn_on_usage (tree decl, int depth, bool last, void *context)
+{
+  if (!last)
+    {
+      /* everything in the alias chain is used / read.  */
+      if (TREE_CODE (decl) == FUNCTION_DECL)
+	C_DECL_USED (decl) = 1;
+      TREE_USED (decl) = 1;
+      mark_exp_read (decl);
+    }
+  if (last && depth != 0)
+    return;
+  tree *original_alias = (tree *)context;
+  bool reported = false;
+  if (TREE_UNAVAILABLE (decl))
+    error_unavailable_use (decl, NULL_TREE);
+  else if (TREE_DEPRECATED (decl))
+    reported = warn_deprecated_use (decl, NULL_TREE);
+  if (reported && !c_tree_equal (decl, *original_alias))
+    inform (DECL_SOURCE_LOCATION (*original_alias),
+	    "through transparent alias here");
+}
+
 
 /* Build an external reference to identifier ID.  FUN indicates
    whether this will be used for a function call.  LOC is the source
@@ -3871,6 +3895,12 @@ build_external_ref (location_t loc, tree id, bool fun, tree *type)
   /* In Objective-C, an instance variable (ivar) may be preferred to
      whatever lookup_name() found.  */
   decl = objc_lookup_ivar (decl, id);
+
+  if (c_alias_decl_p (decl))
+    {
+      decl = c_resolve_alias_decl (decl, ref_alias_decl_warn_on_usage, &decl);
+    }
+  
 
   *type = NULL;
   if (decl && decl != error_mark_node)
@@ -4068,6 +4098,25 @@ c_expr_sizeof_expr (location_t loc, struct c_expr expr)
       pop_maybe_used (C_TYPE_VARIABLE_SIZE (TREE_TYPE (folded_expr)));
     }
   return ret;
+}
+
+/*  Check if a type is a valid target of an alias declaration.  */
+bool
+c_alias_decl_target_p (tree decl) {
+  if (decl == NULL_TREE)
+    return false;
+  if (C_ALIAS_DECL (decl))
+    return true;
+  tree_code code = TREE_CODE (decl);
+  return code == VAR_DECL || code == FUNCTION_DECL || code == PARM_DECL;
+}
+
+/*  Check if a decl is an alias declaration.  */
+bool
+c_alias_decl_p (tree decl) {
+  if (decl == NULL_TREE)
+    return false;
+  return TREE_CODE (decl) == VAR_DECL && C_ALIAS_DECL (decl);
 }
 
 /* Return the result of sizeof applied to T, a structure for the type
