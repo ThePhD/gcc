@@ -35,6 +35,7 @@ typedef struct cpp_hashnode cpp_hashnode;
 typedef struct cpp_macro cpp_macro;
 typedef struct cpp_callbacks cpp_callbacks;
 typedef struct cpp_dir cpp_dir;
+typedef struct cpp_dep_pattern cpp_dep_pattern;
 
 struct _cpp_file;
 
@@ -202,7 +203,7 @@ struct GTY(()) cpp_string {
 #define STRINGIFY_ARG	(1 << 2) /* If macro argument to be stringified.  */
 #define PASTE_LEFT	(1 << 3) /* If on LHS of a ## operator.  */
 #define NAMED_OP	(1 << 4) /* C++ named operators.  */
-#define PREV_FALLTHROUGH (1 << 5) /* On a token preceded by FALLTHROUGH
+#define PREV_FALLTHROUGH (1 << 5) /* On a token preceeded by FALLTHROUGH
 				     comment.  */
 #define DECIMAL_INT     (1 << 6) /* Decimal integer, set in c-lex.cc.  */
 #define PURE_ZERO	(1 << 7) /* Single 0 digit, used by the C++ frontend,
@@ -516,7 +517,7 @@ struct cpp_options
   unsigned char user_literals;
 
   /* Nonzero means warn when a string or character literal is followed by a
-     ud-suffix which does not begin with an underscore.  */
+     ud-suffix which does not beging with an underscore.  */
   unsigned char warn_literal_suffix;
 
   /* Nonzero means interpret imaginary, fixed-point, or other gnu extension
@@ -578,6 +579,9 @@ struct cpp_options
 
   /* Nonzero for the '#embed' directive.  */
   unsigned char embed;
+
+  /* Nonzero for C++29 '#depend' directives.  */
+  unsigned char depend;
 
   /* Holds the name of the target (execution) character set.  */
   const char *narrow_charset;
@@ -781,6 +785,12 @@ enum cpp_warning_reason {
    header is otherwise unfound.  */
 typedef const char *(*missing_header_cb)(cpp_reader *, const char *header, cpp_dir **);
 
+/* Callback for successfully processed #depend <>/#depend "" directives.
+   Downstream entites can use copy_cpp_dep_pattern to hold their own
+   copies of dependency patterns, and cpp_destroy_dep_pattern to free
+   them. */
+typedef void(cpp_depend_cb)(cpp_reader *, const cpp_dep_pattern *);
+
 /* Call backs to cpplib client.  */
 struct cpp_callbacks
 {
@@ -796,6 +806,7 @@ struct cpp_callbacks
   void (*dir_change) (cpp_reader *, const char *);
   void (*include) (cpp_reader *, location_t, const unsigned char *,
 		   const char *, int, const cpp_token **);
+  cpp_depend_cb* depend;
   void (*define) (cpp_reader *, location_t, cpp_hashnode *);
   void (*undef) (cpp_reader *, location_t, cpp_hashnode *);
   void (*ident) (cpp_reader *, location_t, const cpp_string *);
@@ -918,6 +929,45 @@ struct cpp_dir
      directories in the search path.  */
   INO_T_CPP;
   DEV_T_CPP;
+};
+
+/* Chain of directories to look through for #depend'd files in.  */
+struct cpp_dep_pattern
+{
+  /* NULL-terminated singly-linked list.  */
+  struct cpp_dep_pattern *next;
+
+  /* pattern of the directive, NUL-terminated.  */
+  char *pattern;
+  unsigned int pattern_len;
+
+  /* root directory of the pattern before any separators
+     or stars, NUL-terminated.  */
+  char *pattern_root;
+  unsigned int pattern_root_len;
+
+  /* POSIX Extended regular expression recreation source.  */
+  char *regex_source;
+  unsigned int regex_source_len;
+
+  /* pre-compiled regex built off the pattern */
+  struct re_pattern_buffer *pattern_regex;
+
+  /* location where the directive was found */
+  location_t loc;
+
+  /* is this an "export" name (applies to other translation units
+     in e.g. a C++ module) */
+  bool is_exported_p;
+
+  /* whether this came from <> or "" header-name spelling */
+  bool is_angled_p;
+
+  /* whether there is a single `*` not followed by another `*` */
+  bool pattern_has_search;
+
+  /* whether there is a `**` in the search anywhere */
+  bool pattern_has_recursive_search;
 };
 
 /* The kind of the cpp_macro.  */
@@ -1174,6 +1224,13 @@ extern cpp_options *cpp_get_options (cpp_reader *) ATTRIBUTE_PURE;
 extern cpp_callbacks *cpp_get_callbacks (cpp_reader *) ATTRIBUTE_PURE;
 extern void cpp_set_callbacks (cpp_reader *, cpp_callbacks *);
 extern class mkdeps *cpp_get_deps (cpp_reader *) ATTRIBUTE_PURE;
+
+/* given a forward linked list of dirs, find the given "path"
+   */
+extern bool cpp_search_path_with_dir (const char *path, unsigned int path_len,
+				      cpp_dir *dir_list,
+				      cpp_dir *maybe_lookup_dir,
+				      cpp_dir **found_dir);
 
 extern const char *cpp_probe_header_unit (cpp_reader *, const char *file,
 					  bool angle_p,  location_t);
@@ -1580,6 +1637,33 @@ extern cpp_buffer *cpp_get_buffer (cpp_reader *);
 extern struct _cpp_file *cpp_get_file (cpp_buffer *);
 extern cpp_buffer *cpp_get_prev (cpp_buffer *);
 extern void cpp_clear_file_cache (cpp_reader *);
+extern cpp_dep_pattern *cpp_make_dep_pattern (const char *, unsigned int,
+					      bool, bool, location_t);
+extern cpp_dep_pattern *cpp_copy_dep_pattern (const cpp_dep_pattern *);
+extern struct cpp_dep_pattern *cpp_dep_pattern_tail (cpp_dep_pattern *);
+/* destroys the passed-in dep pattern but performs no other actions */
+extern void cpp_destroy_dep_pattern (cpp_dep_pattern *);
+/* destroys the passed-in dep pattern and every object linked in the list */
+extern void cpp_destroy_all_dep_patterns (cpp_dep_pattern *);
+/* checks if the given dependency pattern matches a full real path. */
+extern bool cpp_dep_pattern_simple_check_one (const cpp_dep_pattern *,
+					      const char *, unsigned int);
+/* checks if the whole linked list of dependency patterns */
+extern bool cpp_dep_pattern_simple_check_from (const cpp_dep_pattern *,
+					       const char *, unsigned int);
+extern bool cpp_dep_pattern_check_one (const cpp_dep_pattern *,
+				       const char *, unsigned int,
+				       const char *, unsigned int);
+extern bool cpp_dep_pattern_check_from (const cpp_dep_pattern *,
+					const char*, unsigned int,
+					const char*, unsigned int);
+extern char *append_file_to_dir_name (const char *fname, const char *fdir);
+extern char *append_file_n_to_dir_name (const char *fname, size_t fname_len,
+					const char *fdir);
+extern char *append_file_n_to_dir_name_n (const char *fname, size_t fname_len,
+					  const char *fdir, size_t fdir_len);
+
+
 
 /* cpp_get_converted_source returns the contents of the given file, as it exists
    after cpplib has read it and converted it from the input charset to the
@@ -1744,6 +1828,16 @@ enum cpp_xid_property {
 };
 
 unsigned int cpp_check_xid_property (cppchar_t c);
+
+extern bool cpp_convert_wide_to_narrow (cpp_reader *,
+					const unsigned char *, size_t,
+					unsigned char **, size_t *);
+extern bool cpp_convert_wide_to_utf8 (cpp_reader *,
+				      const unsigned char *, size_t,
+				      unsigned char **, size_t *);
+extern bool cpp_convert_wide_to_utf8_or_narrow (cpp_reader *,
+						const unsigned char *, size_t,
+						unsigned char **, size_t *);
 
 /* In errors.cc */
 

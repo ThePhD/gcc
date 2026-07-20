@@ -1,0 +1,416 @@
+// <embed> -*- C++ -*-
+
+// Copyright The GNU Toolchain Authors.
+//
+// This file is part of the GNU ISO C++ Library.  This library is free
+// software; you can redistribute it and/or modify it under the
+// terms of the GNU General Public License as published by the
+// Free Software Foundation; either version 3, or (at your option)
+// any later version.
+
+// This library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+
+// Under Section 7 of GPL version 3, you are granted additional
+// permissions described in the GCC Runtime Library Exception, version
+// 3.1, as published by the Free Software Foundation.
+
+// You should have received a copy of the GNU General Public License and
+// a copy of the GCC Runtime Library Exception along with this program;
+// see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see
+// <http://www.gnu.org/licenses/>.
+
+/** @file include/embed
+ *  This is a proposed Standard C++ Library header.
+ *  Made with <3.
+ */
+
+#ifndef _GLIBCXX_EMBED
+#define _GLIBCXX_EMBED
+
+#ifdef _GLIBCXX_SYSHDR
+#pragma GCC system_header
+#endif
+
+#define __glibcxx_want_span
+#define __glibcxx_want_optional
+#define __glibcxx_want_source_location
+#define __glibcxx_want_embed
+#include <bits/version.h>
+
+#include <bits/move.h>
+#include <span>
+#include <optional>
+#include <source_location>
+#include <string_view>
+#include <cstddef>
+#include <cassert>
+
+/* the version checking for C++29 is not yet ready; we cannot rely solely on
+   __cpp_lib_embed right now and instead only provide a check
+   on __has_builtin(__builtin_std_embed)
+ */
+#if __cpp_lib_embed
+/* #if defined(__cpp_lib_embed) && __cpp_lib_embed > 0 */
+namespace std _GLIBCXX_VISIBILITY(default)
+{
+_GLIBCXX_BEGIN_NAMESPACE_VERSION
+
+  /**
+   * @defgroup embed Binary data at compile-time
+   * @addtogroup embed
+   * @since C++29
+   * @{
+   */
+
+  /// @brief An error thrown when a file is not found at compile time, particular with `std::embed`.
+  class file_not_found_error : public std::exception
+  {
+  private:
+    optional<string> _M_what;
+    u8string _M_u8what;
+    source_location _M_where;
+
+  public:
+    consteval
+    file_not_found_error(u8string_view __u8what,
+			 source_location __where = source_location::current())
+    noexcept
+    : _M_what(), _M_u8what(__u8what), _M_where(std::move(__where))
+    {
+      /* FIXME: we are just assuming the ordinary literal encoding
+	 can handle UTF-8.  */
+      const size_t __u8what_size = _M_u8what.size();
+      _M_what.emplace(__u8what_size, '\0');
+      string& __wh = *_M_what;
+      for (size_t __idx = 0; __idx < __u8what_size; ++__idx)
+       __wh[__idx] = static_cast<char>(_M_u8what[__idx]);
+    }
+
+    consteval
+    file_not_found_error(string_view __what,
+			 source_location __where = source_location::current())
+    noexcept
+    : _M_what(__what), _M_u8what(), _M_where(std::move(__where))
+    {
+      /* FIXME: we are just assuming the ordinary literal encoding
+	 can handle UTF-8.  */
+      const size_t __what_size = _M_what->size();
+      _M_u8what.resize(__what_size);
+      string& __wh = *_M_what;
+      for (size_t __idx = 0; __idx < __what_size; ++__idx)
+	_M_u8what[__idx] = __wh[__idx];
+    }
+
+    file_not_found_error(const file_not_found_error&) = default;
+    file_not_found_error(file_not_found_error&&)      = default;
+
+    file_not_found_error& operator=(const file_not_found_error&) = default;
+    file_not_found_error& operator=(file_not_found_error&&)      = default;
+
+    constexpr const char*
+    what() const noexcept override
+    { return _M_what ? _M_what->c_str() : ""; }
+
+    consteval u8string_view
+    u8what() const noexcept
+    { return _M_u8what; }
+
+    consteval source_location
+    where() const noexcept
+    { return _M_where; }
+  };
+
+  /// @brief An error thrown when a file is found, but not properly `#depend`-ed on for use with with `std::embed`.
+  class dependency_error : public std::exception
+  {
+  private:
+    optional<string> _M_what;
+    u8string _M_u8what;
+    source_location _M_where;
+
+  public:
+    consteval
+    dependency_error(u8string_view __u8what,
+		     source_location __where = source_location::current())
+    noexcept
+    : _M_what(), _M_u8what(__u8what), _M_where(std::move(__where))
+    {
+      /* FIXME: we are just assuming the ordinary literal encoding
+	 can handle UTF-8.  */
+      const size_t __u8what_size = _M_u8what.size();
+      _M_what.emplace(__u8what_size, '\0');
+      string& __wh = *_M_what;
+      for (size_t __idx = 0; __idx < __u8what_size; ++__idx)
+       __wh[__idx] = static_cast<char>(_M_u8what[__idx]);
+    }
+
+    consteval
+    dependency_error(string_view __what,
+		     source_location __where = source_location::current())
+    noexcept
+    : _M_what(__what), _M_u8what(), _M_where(std::move(__where))
+    {
+      /* FIXME: we are just assuming the ordinary literal encoding
+	 can handle UTF-8.  */
+      const size_t __what_size = _M_what->size();
+      _M_u8what.resize(__what_size);
+      string& __wh = *_M_what;
+      for (size_t __idx = 0; __idx < __what_size; ++__idx)
+	_M_u8what[__idx] = __wh[__idx];
+    }
+
+    dependency_error(const dependency_error&) = default;
+    dependency_error(dependency_error&&)      = default;
+
+    dependency_error& operator=(const dependency_error&) = default;
+    dependency_error& operator=(dependency_error&&)      = default;
+
+    constexpr const char*
+    what() const noexcept override
+    { return _M_what ? _M_what->c_str() : ""; }
+
+    consteval u8string_view
+    u8what() const noexcept
+    { return _M_u8what; }
+
+    consteval source_location
+    where() const noexcept
+    { return _M_where; }
+  };
+
+/// @cond undocumented
+namespace __embed
+{
+
+  enum __builtin_embed_status
+    {
+      __file_not_found = 0,
+      __file_found = 1,
+      __file_found_no_depends = 2,
+      __file_found_empty = 3,
+    };
+
+  inline constexpr unsigned int __quoted_search_distance = 0b101;
+  inline constexpr unsigned int __where_distance	 = 0b010;
+
+#define _GLIBCXX_EMBED_FAIL(...)		\
+  do						\
+    {						\
+      __glibcxx_assert(false && __VA_ARGS__);   \
+      __builtin_abort();			\
+    } while(false)
+
+#if defined(__cpp_constexpr_exceptions) && defined(__cpp_exceptions)
+#define _GLIBCXX_EMBED_FAIL_WITH(_TY, _MSG, _LOC) throw _TY(_MSG, _LOC)
+#else
+#define _GLIBCXX_EMBED_FAIL_WITH(_TY, _MSG, _LOC) _GLIBCXX_EMBED_FAIL(_MSG)
+#endif
+  // generic implementation to save on copy-paste nonsense
+  // and not come up with clever constraints for the `__resource`
+  // type.
+  template<typename _By, size_t _Ex, typename _Sv>
+    [[nodiscard]]
+    consteval span<const _By, _Ex>
+    __embed(const _Sv& __resource, size_t __offset,
+	    [[maybe_unused]] const optional<size_t>& __limit)
+    noexcept
+    {
+      int __status = -1;
+      _By const* __ptr = nullptr;
+      size_t __size = 0;
+      if constexpr (_Ex != dynamic_extent)
+	{
+	  __ptr = __builtin_std_embed(__quoted_search_distance, __status,
+				      __size, __ptr,
+				      __resource.size(), __resource.data(),
+				      __offset, _Ex);
+	}
+      else
+	{
+	  __ptr = __limit
+	    ? __builtin_std_embed(__quoted_search_distance, __status,
+				  __size, __ptr,
+				  __resource.size(), __resource.data(),
+				  __offset, *__limit)
+	    : __builtin_std_embed(__quoted_search_distance, __status,
+				  __size, __ptr,
+				  __resource.size(), __resource.data(),
+				  __offset);
+	}
+      if (__status == __file_not_found)
+	{
+#if __has_builtin(__builtin_source_location_at)
+	  auto __where = __builtin_source_location_at(__where_distance);
+	  [[maybe_unused]] auto __loc = source_location::current(__where);
+#else
+	  [[maybe_unused]] auto __loc = source_location::current();
+#endif
+	  _GLIBCXX_EMBED_FAIL_WITH(dependency_error,
+			   "file not covered by a '#depend' directive", __loc);
+	}
+      if (__status == __file_found_no_depends)
+	{
+#if __has_builtin(__builtin_source_location_at)
+	  auto __where = __builtin_source_location_at(__where_distance);
+	  [[maybe_unused]] auto __loc = source_location::current(__where);
+#else
+	  [[maybe_unused]] auto __loc = source_location::current();
+#endif
+	  _GLIBCXX_EMBED_FAIL_WITH(dependency_error,
+			   "file not covered by a '#depend' directive", __loc);
+	}
+      if constexpr (_Ex != dynamic_extent)
+	{
+	  if (_Ex > __size)
+	    {
+	      _GLIBCXX_EMBED_FAIL("extent is larger than the file's size");
+	    }
+	  __size = _Ex;
+	}
+      if (__status == __file_found_empty)
+	{
+	  return span<const _By, _Ex>();
+	}
+      return span<const _By, _Ex>(__ptr, __size);
+    }
+
+#undef _GLIBCXX_EMBED_FAIL
+#undef _GLIBCXX_EMBED_FAIL_WITH
+
+}
+/// @endcond
+
+
+  /// @brief Embed a backing array of binary data of type `const _By`
+  /// @tparam _By Shall be one of `unsigned char`, `char`, or `std::byte`.
+  /// @param[in] __resource The name of the resource. The treatment of the
+  ///		       encoding of the string is unspecified
+  ///		       and subject to frontend builtins.
+  /// @param[in] __offset The number of `const T` elements to skip from the
+  ///		     resource. Applied before the limit.
+  /// @param[in] __limit The maximum number of `const T` elements to read,
+  ///		    after the offset is applied.
+  /// @return A view into the specified resource at `__offset` with up to
+  ///	 `__limit` elements, or the rest of the resource if `__limit` is
+  ///	 `nullopt`.
+  template<typename _By = byte>
+    [[nodiscard]]
+    consteval span<const _By>
+    embed(string_view __resource, size_t __offset = 0,
+	  optional<size_t> __limit = nullopt)
+    noexcept
+    {
+      return __embed::__embed<_By, dynamic_extent>(__resource, __offset, __limit);
+    }
+
+  /// @brief Embed a backing array of binary data of type `const _By`
+  /// @tparam _By Shall be one of `unsigned char`, `char`, or `std::byte`.
+  /// @param[in] __resource The name of the resource. The treatment of the
+  ///		       encoding of the string is unspecified
+  ///		       and subject to frontend builtins.
+  /// @param[in] __offset The number of `const T` elements to skip from the
+  ///		     resource. Applied before the limit.
+  /// @param[in] __limit The maximum number of `const T` elements to read,
+  ///		    after the offset is applied.
+  /// @return A view into the specified resource at `__offset` with up to
+  ///	 `__limit` elements, or the rest of the resource if `__limit` is
+  ///	 `nullopt`.
+  template<typename _By = byte>
+    [[nodiscard]]
+    consteval span<const _By>
+    embed(wstring_view __resource, size_t __offset = 0, optional<size_t> __limit = nullopt)
+    noexcept
+    {
+      return __embed::__embed<_By, dynamic_extent>(__resource, __offset, __limit);
+    }
+
+  /// @brief Embed a backing array of binary data of type `const _By`
+  /// @tparam _By Shall be one of `unsigned char`, `char`, or `std::byte`.
+  /// @param[in] __resource The name of the resource. The treatment of the
+  ///		       encoding of the string is unspecified
+  ///		       and subject to frontend builtins.
+  /// @param[in] __offset The number of `const T` elements to skip from the
+  ///		     resource. Applied before the limit.
+  /// @param[in] __limit The maximum number of `const T` elements to read,
+  ///		    after the offset is applied.
+  /// @return A view into the specified resource at `__offset` with up to
+  ///	 `__limit` elements, or the rest of the resource if `__limit` is
+  ///	 `nullopt`.
+  template<typename _By = byte>
+    [[nodiscard]]
+    consteval span<const _By>
+    embed(u8string_view __resource, size_t __offset = 0, optional<size_t> __limit = nullopt)
+    noexcept
+    {
+      return __embed::__embed<_By, dynamic_extent>(__resource, __offset, __limit);
+    }
+
+  /// @brief Embed a backing array of binary data of type `const _By`
+  /// @tparam _By Shall be one of `unsigned char`, `char`, or `std::byte`.
+  /// @tparam _Ex The exact size of the data that will be returned.
+  /// @param[in] __resource The name of the resource. The treatment of the
+  ///		       encoding of the string is unspecified
+  ///		       and subject to frontend builtins.
+  /// @param[in] __offset The number of `const T` elements to skip from the
+  ///		     resource. Applied before the limit.
+  /// @return A view into the specified resource at `__offset` with exactly
+  ///	 `_Ex` elements.
+  template<size_t _Ex, typename _By = byte>
+    [[nodiscard]]
+    consteval span<const _By, _Ex>
+    embed(string_view __resource, size_t __offset = 0)
+    noexcept
+    {
+      return __embed::__embed<_By, _Ex>(__resource, __offset, nullopt);
+    }
+
+  /// @brief Embed a backing array of binary data of type `const _By`
+  /// @tparam _By Shall be one of `unsigned char`, `char`, or `std::byte`.
+  /// @tparam _Ex The exact size of the data that will be returned.
+  /// @param[in] __resource The name of the resource. The treatment of the
+  ///		       encoding of the string is unspecified
+  ///		       and subject to frontend builtins.
+  /// @param[in] __offset The number of `const T` elements to skip from the
+  ///		     resource. Applied before the limit.
+  /// @return A view into the specified resource at `__offset` with exactly
+  ///	 `_Ex` elements.
+  template<size_t _Ex, typename _By = byte>
+    [[nodiscard]]
+    consteval span<const _By, _Ex>
+    embed(wstring_view __resource, size_t __offset = 0)
+    noexcept
+    {
+      return __embed::__embed<_By, _Ex>(__resource, __offset, nullopt);
+    }
+
+  /// @brief Embed a backing array of binary data of type `const _By`
+  /// @tparam _By Shall be one of `unsigned char`, `char`, or `std::byte`.
+  /// @tparam _Ex The exact size of the data that will be returned.
+  /// @param[in] __resource The name of the resource. The treatment of the
+  ///		       encoding of the string is unspecified
+  ///		       and subject to frontend builtins.
+  /// @param[in] __offset The number of `const T` elements to skip from the
+  ///		     resource. Applied before the limit.
+  /// @return A view into the specified resource at `__offset` with exactly
+  ///	 `_Ex` elements.
+  template<size_t _Ex, typename _By = byte>
+    [[nodiscard]]
+    consteval span<const _By, _Ex>
+    embed(u8string_view __resource, size_t __offset = 0)
+    noexcept
+    {
+      return __embed::__embed<_By, _Ex>(__resource, __offset, nullopt);
+    }
+
+  /**
+   * @}
+   */
+
+_GLIBCXX_END_NAMESPACE_VERSION
+} // namespace std
+
+#endif // __cpp_lib_embed
+#endif // _GLIBCXX_EMBED

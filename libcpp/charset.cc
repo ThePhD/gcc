@@ -822,6 +822,10 @@ cpp_init_iconv (cpp_reader *pfile)
   pfile->char32_cset_desc.width = 32;
   pfile->wide_cset_desc = init_iconv_desc (pfile, wcset, SOURCE_CHARSET);
   pfile->wide_cset_desc.width = CPP_OPTION (pfile, wchar_precision);
+  pfile->wide_to_utf8_cset_desc = init_iconv_desc (pfile, "UTF-8", wcset);
+  pfile->wide_to_utf8_cset_desc.width = CPP_OPTION (pfile, char_precision);
+  pfile->wide_to_narrow_cset_desc = init_iconv_desc (pfile, wcset, ncset);
+  pfile->wide_to_narrow_cset_desc.width = CPP_OPTION (pfile, char_precision);
 }
 
 /* Destroy iconv(3) descriptors set up by cpp_init_iconv, if necessary.  */
@@ -844,6 +848,10 @@ _cpp_destroy_iconv (cpp_reader *pfile)
 	iconv_close (pfile->reverse_narrow_cset_desc.cd);
       if (pfile->reverse_utf8_cset_desc.func == convert_using_iconv)
 	iconv_close (pfile->reverse_utf8_cset_desc.cd);
+      if (pfile->wide_to_utf8_cset_desc.func == convert_using_iconv)
+	iconv_close (pfile->wide_to_utf8_cset_desc.cd);
+      if (pfile->wide_to_narrow_cset_desc.func == convert_using_iconv)
+	iconv_close (pfile->wide_to_narrow_cset_desc.cd);
     }
 }
 
@@ -903,7 +911,7 @@ cpp_host_to_exec_charset (cpp_reader *pfile, cppchar_t c)
   return c;
 }
 
-
+
 
 /* cpp_substring_ranges's constructor. */
 
@@ -948,7 +956,7 @@ cpp_substring_ranges::add_n_ranges (int num,
     add_range (loc_reader.get_next ());
 }
 
-
+
 
 /* Utility routine that computes a mask of the form 0000...111... with
    WIDTH 1-bits.  */
@@ -2447,7 +2455,7 @@ convert_escape (cpp_reader *pfile, const uchar *from, const uchar *limit,
 
   return from + 1;
 }
-
+
 /* TYPE is a token type.  The return value is the conversion needed to
    convert from source to execution character set for the given type. */
 static struct cset_converter
@@ -2834,7 +2842,7 @@ cpp_valid_identifier (cpp_reader *pfile, const unsigned char *id)
   return true;
 }
 
-
+
 /* Return number of source characters in STR.  */
 static unsigned
 count_source_chars (cpp_reader *pfile, cpp_string str, cpp_ttype type)
@@ -3103,7 +3111,7 @@ cpp_interpret_charconst (cpp_reader *pfile, const cpp_token *token,
 
   return result;
 }
-
+
 /* Convert an identifier denoted by ID and LEN, which might contain
    UCN escapes or UTF-8 multibyte chars, to the source character set,
    either UTF-8 or UTF-EBCDIC.  Assumes that the identifier is actually
@@ -3185,7 +3193,7 @@ _cpp_interpret_identifier (cpp_reader *pfile, const uchar *id, size_t len)
   return CPP_HASHNODE (ht_lookup (pfile->hash_table,
 				  buf, bufp - buf, HT_ALLOC));
 }
-
+
 
 /* Utility to strip a UTF-8 byte order marking from the beginning
    of a buffer.  Returns the number of bytes to skip, which currently
@@ -3533,6 +3541,57 @@ get_cppchar_property (cppchar_t c,
     return range_values[begin];
 
   return default_value;
+}
+
+bool
+cpp_convert_wide_to_narrow (cpp_reader *pfile, const uchar *from, size_t flen,
+			    uchar **pto, size_t *ptlen)
+{
+  struct _cpp_strbuf to = {.text = NULL, .asize = 0, .len = 0 };
+  to.asize = MAX (OUTBUF_BLOCK_SIZE, flen);
+  to.text = XNEWVEC (uchar, to.asize);
+  cset_converter *conv = &pfile->wide_to_narrow_cset_desc;
+  bool success = conv->func(conv->cd, from, flen, &to);
+  if (success)
+    {
+      *pto = to.text;
+      *ptlen = to.len;
+    }
+  else
+    {
+      free (to.text);
+    }
+  return success;
+}
+
+bool
+cpp_convert_wide_to_utf8 (cpp_reader *pfile, const uchar *from, size_t flen,
+			  uchar **pto, size_t *ptlen)
+{
+  struct _cpp_strbuf to = {.text = NULL, .asize = 0, .len = 0 };
+  to.asize = MAX (OUTBUF_BLOCK_SIZE, flen);
+  to.text = XNEWVEC (uchar, to.asize);
+  cset_converter *conv = &pfile->wide_to_utf8_cset_desc;
+  bool success = conv->func(conv->cd, from, flen, &to);
+  if (success)
+    {
+      *pto = to.text;
+      *ptlen = to.len;
+    }
+  else
+    {
+      free (to.text);
+    }
+  return success;
+}
+
+extern bool
+cpp_convert_wide_to_utf8_or_narrow (cpp_reader *pfile, const uchar *from, size_t flen,
+				    uchar **pto, size_t *ptlen)
+{
+  if (cpp_convert_wide_to_utf8 (pfile, from, flen, pto, ptlen))
+    return true;
+  return cpp_convert_wide_to_narrow (pfile, from, flen, pto, ptlen);
 }
 
 /* Our own version of wcwidth().  We don't use the actual wcwidth() in glibc,

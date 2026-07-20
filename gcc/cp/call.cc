@@ -11572,6 +11572,12 @@ build_cxx_call (tree fn, int nargs, tree *argarray,
 					     orig_fndecl, nargs, argarray,
 					     complain & tf_error))
 	return error_mark_node;
+      else if (fndecl_built_in_p (fndecl, CP_BUILT_IN_STD_EMBED,
+				  BUILT_IN_FRONTEND)
+	       && !cp_check_builtin_std_embed (cp_expr_location (fn), vNULL,
+					       &fn, fndecl, nargs, argarray,
+					       complain & tf_error))
+	return error_mark_node;
       else if (fndecl_built_in_p (fndecl, BUILT_IN_CLEAR_PADDING))
 	{
 	  tree arg0 = argarray[0];

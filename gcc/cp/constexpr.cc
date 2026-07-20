@@ -26,6 +26,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "cp-tree.h"
 #include "varasm.h"
 #include "c-family/c-objc.h"
+#include "c-family/c-pragma.h"
 #include "tree-iterator.h"
 #include "gimplify.h"
 #include "builtins.h"
@@ -42,6 +43,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "intl.h"
 #include "toplev.h"
 #include "contracts.h"
+#include "incpath.h"
 
 static bool verify_constant (tree, bool, bool *, bool *);
 #define VERIFY_CONSTANT(X)						\
@@ -2319,6 +2321,21 @@ static vec<tree> call_stack;
 static int call_stack_tick;
 static int last_cx_error_tick;
 
+static tree
+cxx_eval_call_stack_up (unsigned distance)
+{
+  unsigned call_stack_len = call_stack.length ();
+  if (call_stack_len == 0u)
+    return NULL_TREE;
+  if (call_stack_len <= distance)
+    return call_stack[0];
+  if (distance == 0u)
+    return call_stack.last ();
+  tree *target_call = &call_stack.last ();
+  target_call -= MIN (call_stack_len, distance);
+  return *target_call;
+}
+
 /* Attempt to evaluate T which represents a call to __builtin_constexpr_diag.
    The arguments should be an integer (0 for inform, 1 for warning, 2 for
    error) optionally with 16 ored in if it should use caller's caller location
@@ -2468,6 +2485,7 @@ cxx_eval_builtin_function_call (const constexpr_ctx *ctx, tree t, tree fun,
 {
   const int nargs = call_expr_nargs (t);
   tree *args = (tree *) alloca (nargs * sizeof (tree));
+  location_t *arg_locs = (location_t *) alloca (nargs * sizeof (location_t));
   tree new_call;
   int i;
 
@@ -2593,7 +2611,7 @@ cxx_eval_builtin_function_call (const constexpr_ctx *ctx, tree t, tree fun,
     {
       tree arg = CALL_EXPR_ARG (t, i);
       tree oarg = arg;
-
+      arg_locs[i] = cp_expr_location (oarg);
       /* To handle string built-ins we need to pass ADDR_EXPR<STRING_CST> since
 	 expand_builtin doesn't know how to look in the values table.  */
       bool strop = i < strops;
@@ -2693,6 +2711,12 @@ cxx_eval_builtin_function_call (const constexpr_ctx *ctx, tree t, tree fun,
 	  args[0] = arg;
 	}
       new_call = fold_builtin_is_string_literal (loc, nargs, args);
+    }
+  else if (fndecl_built_in_p (fun, CP_BUILT_IN_STD_EMBED,
+			      BUILT_IN_FRONTEND))
+    {
+      new_call = cp_fold_builtin_std_embed (EXPR_LOCATION (t), nargs,
+					    arg_locs, args);
     }
   else
     new_call = fold_builtin_call_array (EXPR_LOCATION (t), TREE_TYPE (t),
@@ -13293,6 +13317,450 @@ fini_constexpr (void)
   /* The contexpr call and fundef copies tables are no longer needed.  */
   constexpr_call_table = NULL;
   fundef_copies_table = NULL;
+}
+
+/* Build a constant, static data array using ARR_ELEM_TYPE.  */
+static inline tree
+build_static_constexpr_constant_array (location_t loc, void *data,
+				       unsigned HOST_WIDE_INT data_size,
+				       tree data_type, tree arr_elem_type)
+{
+  tree arr_type = build_array_type_nelts (arr_elem_type, data_size);
+  tree var = build_decl (loc, VAR_DECL,
+			 generate_internal_label ("bsca"), arr_type);
+  TREE_STATIC (var) = 1;
+  TREE_PUBLIC (var) = 0;
+  DECL_ARTIFICIAL (var) = 1;
+  DECL_IGNORED_P (var) = 1;
+  DECL_EXTERNAL (var) = 0;
+  DECL_DECLARED_CONSTEXPR_P (var) = 1;
+  DECL_INITIALIZED_BY_CONSTANT_EXPRESSION_P (var) = 1;
+  TREE_CONSTANT (var) = 1;
+  TREE_READONLY (var) = 1;
+  /* Isn't this already called by build_decl for VAR_DECLs?? */
+  layout_decl (var, 0);
+  tree raw_data_init = make_node (RAW_DATA_CST);
+  TREE_TYPE (raw_data_init) = data_type;
+  // store data in a string owner
+  tree owner = build_string (data_size, (const char *) data);
+  TREE_TYPE (owner) = build_array_type_nelts (unsigned_char_type_node,
+					      data_size);
+  TREE_CONSTANT (owner) = true;
+
+  RAW_DATA_OWNER (raw_data_init) = owner;
+  RAW_DATA_POINTER (raw_data_init) = TREE_STRING_POINTER (owner);
+  RAW_DATA_LENGTH (raw_data_init) = data_size;
+  TREE_CONSTANT (raw_data_init) = true;
+
+  tree ctor = build_constructor_single (arr_type, integer_zero_node,
+					raw_data_init);
+  TREE_CONSTANT (ctor) = 1;
+  TREE_STATIC (ctor) = 1;
+  DECL_INITIAL (var) = ctor;
+  TREE_USED (var) = 1;
+  TREE_USED (ctor) = 1;
+  varpool_node::finalize_decl (var);
+
+  return var;
+}
+
+tree
+cp_fold_builtin_std_embed (location_t loc, int nargs,
+			   location_t * arg_locs, tree *args)
+{
+  constexpr int file_not_found = 0;
+  constexpr int file_found = 1;
+  constexpr int file_found_no_depend = 2;
+  constexpr int file_found_empty = 3;
+
+  const auto arg_location = [&](tree& arg) -> location_t
+    {
+      int idx = &arg - args;
+      return !arg_locs || idx >= nargs
+	? cp_expr_loc_or_loc (arg, loc)
+	: expansion_point_location (arg_locs[idx]);
+    };
+
+  const bool has_limit_arg = nargs == 8;
+  /* should have already been checked but we do this here too anyways */
+  if (nargs < 7 && !has_limit_arg)
+    {
+      internal_error ("incorrect number of %<__builtin_std_embed%> arguments");
+      return error_mark_node;
+    }
+  tree &locus_arg = args[0];
+  tree &status_ref_arg = args[1];
+  tree &size_ref_arg = args[2];
+  tree &ptr_indicator_arg = args[3];
+  tree &resource_name_size_arg = args[4];
+  tree &resource_name_ptr_arg = args[5];
+  tree &offset_arg = args[6];
+  /* all other args are already type checked, we just need to make sure
+     they are constants that we can fold at this point.  */
+  if (!tree_fits_uhwi_p (locus_arg))
+    {
+      error_at (arg_location (locus_arg),
+		"integer constant expression %qE is too large",
+		locus_arg);
+      return error_mark_node;
+    }
+  if (!tree_fits_uhwi_p (resource_name_size_arg))
+    {
+      error_at (arg_location (resource_name_size_arg),
+		"integer constant expression %qE is too large",
+		resource_name_size_arg);
+      return error_mark_node;
+    }
+  if (!tree_fits_uhwi_p (offset_arg))
+    {
+      error_at (arg_location (offset_arg),
+		"integer constant expression %qE is too large",
+		offset_arg);
+      return error_mark_node;
+    }
+  unsigned HOST_WIDE_INT resource_name_lenh =
+    tree_to_uhwi (resource_name_size_arg);
+  unsigned HOST_WIDE_INT locus = tree_to_uhwi (locus_arg);
+  const bool do_local_search = (locus & HOST_WIDE_INT_1) == HOST_WIDE_INT_1;
+  unsigned HOST_WIDE_INT limit_storage = 0;
+  unsigned HOST_WIDE_INT offset = tree_to_uhwi (offset_arg);
+  unsigned HOST_WIDE_INT *limit = NULL;
+  /* limit_arg is part of the variable part of the tree, so we need to
+     at least type-check it here in the fold.  */
+  if (has_limit_arg)
+    {
+      tree &limit_arg = args[7];
+      if (!tree_fits_uhwi_p (limit_arg))
+	{
+	  error_at (arg_location (limit_arg),
+		    "integer constant expression %qE is too large",
+		    limit_arg);
+	  return error_mark_node;
+	}
+      limit_storage = tree_to_uhwi (limit_arg);
+      limit = &limit_storage;
+    }
+  else
+    {
+      limit = NULL;
+    }
+
+  tree elem_type = TREE_TYPE (TREE_TYPE (ptr_indicator_arg));
+  tree unqual_elem_type = TYPE_MAIN_VARIANT (elem_type);
+  tree elem_pointer_type = build_pointer_type (elem_type);
+  tree resource_root_offset_value = NULL_TREE;
+  tree resource_root_size_value = NULL_TREE;
+  tree resource_root_str_value = string_constant (resource_name_ptr_arg,
+						  &resource_root_offset_value,
+						  &resource_root_size_value,
+						  NULL);
+  if (resource_root_str_value == NULL_TREE)
+    {
+      /* DETAILS, FIXME: if you are getting this error / reading this, this is
+	 a problem with relying on string_constant to read string values as it
+	 is not yet a complete handler of ALL types of strings. Specifically,
+	 it can handle integral types that are CHAR_BIT in size and shaped like
+	 a char type. But if you pass in an array of e.g. wchar_t (or char16_t,
+	 or char32_t, though this function does not take this as input name
+	 types), string_constant does not have handling code in there for that.
+
+	 So, it just breaks. This code is here to prevent segfaults and give a
+	 real error, but it's a weakness that should be fixed in
+	 string_constant, at some point. An easy reproducer is to feed these:
+
+		const wchar_t arr[1] = {}; // busted...
+		const wchar_t* ptr = L""; // okay!
+
+	 into something that hits string_constant. Both of these should be
+	 treated exactly the same.  */
+      sorry_at (arg_location (resource_name_ptr_arg),
+		"could not read the provided resource value"
+		" of type %qT from %qE",
+		TREE_TYPE (resource_name_ptr_arg), resource_name_ptr_arg);
+      return error_mark_node;
+    }
+  unsigned HOST_WIDE_INT resource_root_offset =
+    resource_root_offset_value == NULL_TREE ? 0 : 
+      tree_to_uhwi (resource_root_offset_value);
+  unsigned HOST_WIDE_INT resource_root_size =
+    resource_root_size_value == NULL_TREE ? 0 : 
+      tree_to_uhwi (resource_root_size_value);
+  /* sanity check: out-of-bounds access in resource name string;
+     this should have been caught much, much earlier.  */
+  if (resource_root_size < resource_root_offset
+      || ((resource_root_size - resource_root_offset) < resource_name_lenh))
+    {
+      error_at (arg_location (resource_name_size_arg),
+		"source string of size %llu and offset %llu is not usable "
+		"for a resource name of size %llu",
+		(unsigned long long)resource_root_size,
+		(unsigned long long)resource_root_offset,
+		(unsigned long long)resource_name_lenh);
+      return error_mark_node;
+    }
+  auto write_out_status = [&](int status) -> tree
+    {
+      tree status_value = build_int_cst (integer_type_node, status);
+      tree status_out_target =
+	build_fold_indirect_ref_loc (arg_location (status_ref_arg),
+				     status_ref_arg);
+      tree status_write =
+	fold_build2_loc (arg_location (status_ref_arg),
+			 MODIFY_EXPR, TREE_TYPE (status_out_target),
+			 status_out_target, status_value);
+      return status_write;
+    };
+  auto fold_status_fail = [&](int status) -> tree
+    {
+      tree status_write = write_out_status(status);
+      return fold_build2_loc (loc, COMPOUND_EXPR,
+			      TREE_TYPE (null_pointer_node),
+			      status_write, null_pointer_node);
+    };
+  auto fold_status_success =
+    [&](int status, tree size_value = size_zero_node,
+	tree pointer_value = null_pointer_node) -> tree
+    {
+      tree size_out_target =
+	build_fold_indirect_ref_loc (arg_location (size_ref_arg),
+				     size_ref_arg);
+      tree size_out_type = TREE_TYPE (size_out_target);
+      tree size_write =
+	fold_build2_loc (arg_location (size_ref_arg), MODIFY_EXPR,
+			 size_out_type, size_out_target, size_value);
+      tree status_write = write_out_status (status);
+      tree status_and_ptr = fold_build2_loc (loc, COMPOUND_EXPR,
+					     elem_pointer_type,
+					     status_write, pointer_value);
+      return fold_build2_loc (loc, COMPOUND_EXPR, elem_pointer_type,
+			      size_write, status_and_ptr);
+    };
+
+  const char *original_resource_name =
+    TREE_STRING_POINTER (resource_root_str_value) + resource_root_offset;
+  const char *resource_name = original_resource_name;
+  if (resource_name_lenh > (unsigned HOST_WIDE_INT)UINT_MAX)
+    {
+      error_at (arg_location (resource_name_size_arg),
+		"%llu is too large to use for the resource name size",
+		(unsigned long long)resource_name_lenh);
+      return error_mark_node;
+    }
+  tree resource_name_arr_type = TREE_TYPE (resource_root_str_value);
+  tree resource_name_arr_elem_type = TREE_TYPE (resource_name_arr_type);
+  tree resource_name_type = TYPE_MAIN_VARIANT (resource_name_arr_elem_type);
+  unsigned HOST_WIDE_INT type_name_size =
+    tree_to_uhwi (TYPE_SIZE_UNIT (resource_name_type));
+  unsigned int resource_name_len =
+    (unsigned int)(resource_name_lenh * type_name_size);
+  if (type_name_size != 1)
+    {
+      /* must be a wide character type; need to convert based on libcp.  */
+      const unsigned char *uresource_name =
+	(const unsigned char*)resource_name;
+      unsigned char *conv_str_ptr = NULL;
+      size_t conv_str_size = 0;
+      const bool conv_success =
+	cpp_convert_wide_to_utf8_or_narrow (parse_in,
+					    uresource_name, resource_name_len,
+					    &conv_str_ptr, &conv_str_size);
+      if (!conv_success)
+	{
+	  error_at(arg_location (resource_name_ptr_arg),
+		   "could not convert wide character resource name to "
+		   "usable file name");
+	  return error_mark_node;
+	}
+      resource_name = (const char*)conv_str_ptr;
+      resource_name_len = (unsigned int)conv_str_size;
+    }
+  struct cleanup_name_t
+    {
+      const char *p;
+      ~cleanup_name_t()
+	{
+	  free (const_cast<void *>((const void *)p));
+	}
+    };
+
+  cleanup_name_t cleanup_resource_name =
+    {
+      resource_name == original_resource_name ? NULL : resource_name
+    };
+  static constexpr const char *empty_sentinel = "";
+  const char *lookup_from = NULL;
+  if (do_local_search)
+    {
+      int call_stack_distance = (int)(locus >> HOST_WIDE_INT_1);
+      if (call_stack_distance)
+	{
+	  tree target_call = cxx_eval_call_stack_up (call_stack_distance);
+	  location_t maybe_wrapper_invocation_loc =
+	    arg_location (target_call);
+	  lookup_from = LOCATION_FILE (maybe_wrapper_invocation_loc);
+	}
+      else
+	{
+	  lookup_from = LOCATION_FILE (loc);
+	}
+    }
+  const char *original_lookup_from = lookup_from;
+  if (lookup_from)
+    {
+      const char *first_slash = strrchr (lookup_from, '/');
+      const char * first_rslash = strrchr (lookup_from, '\\');
+      if (first_slash != NULL || first_rslash != NULL)
+	{
+	  ptrdiff_t len = first_slash != NULL
+	    ? first_slash - lookup_from
+	    : 0;
+	  ptrdiff_t rlen = first_rslash != NULL
+	    ? first_rslash - lookup_from
+	    : 0;
+	  if (len < rlen)
+	    len = rlen;
+	  len += 1;
+	  char *new_lookup_from = XCNEWVEC (char, len + 1);
+	  memcpy (new_lookup_from, lookup_from, len - 1);
+	  new_lookup_from[len - 1] = '/';
+	  new_lookup_from[len] = '\0';
+	  lookup_from = new_lookup_from;
+	}
+      else
+	{
+	  /* there is no seperator -- working directory or
+	     non-suffixed drive?? */
+	  if (!IS_ABSOLUTE_PATH (lookup_from))
+	    {
+	      /* it's non-absolute but with no path separators:
+		 assume it's based on the CWD */
+	      lookup_from = empty_sentinel;
+	    }
+	}
+    }
+  struct cleanup_name_t cleanup_lookup =
+    {
+      lookup_from == original_lookup_from || lookup_from == empty_sentinel
+	? NULL
+	: lookup_from
+    };
+  const char *found_name = NULL;
+  if (!search_path_kind (resource_name, resource_name_len,
+			 INC_EMBED, lookup_from, &found_name, NULL))
+    {
+      return fold_status_fail (file_not_found);
+    }
+  struct cleanup_name_t cleanup_name = {found_name};
+  unsigned int found_name_len = (unsigned int)strlen (found_name);
+  if (!cpp_dep_pattern_check (resource_name, resource_name_len,
+			      found_name, found_name_len))
+    {
+      return fold_status_fail (file_found_no_depend);
+    }
+
+  if (limit && *limit == HOST_WIDE_INT_0U)
+    {
+      return fold_status_success (file_found_empty);
+    }
+
+  struct stat found_name_st;
+  if (stat (found_name, &found_name_st) != 0)
+    {
+      return fold_status_fail (file_not_found);
+    }
+  if (!S_ISREG (found_name_st.st_mode) && limit == NULL)
+    {
+      /* reading from a non-regular file without a limit can result in an
+	 infinite read / improper read: error out to protect us */
+      error_at (loc, "the file is a non-regular file (such as a block, socket,"
+		" or character device) and no limit argument was specified");
+      return error_mark_node;
+    }
+  const unsigned HOST_WIDE_INT impl_resource_size =
+    (unsigned HOST_WIDE_INT)found_name_st.st_size;
+  if (impl_resource_size == HOST_WIDE_INT_0U || offset >= impl_resource_size
+      || (limit && *limit == HOST_WIDE_INT_0U))
+    {
+      return fold_status_success (file_found_empty);
+    }
+
+  unsigned HOST_WIDE_INT resource_size = impl_resource_size - offset;
+  if (limit && resource_size > *limit)
+    {
+      resource_size = *limit;
+    }
+
+  char *resource_ptr = NULL;
+  FILE *resource_file = fopen (found_name, "rb");
+  if (resource_file == NULL)
+    {
+      return fold_status_fail (file_not_found);
+    }
+  struct cleanup_file_t
+    {
+      FILE *f;
+      char **p;
+      ~cleanup_file_t ()
+	{
+	  fclose (f);
+	  free ((void *)*p);
+	}
+    } cleanup_file = {resource_file, &resource_ptr};
+
+  resource_ptr = XCNEWVEC (char, resource_size);
+  if (offset > 0 && fseek (resource_file, offset, SEEK_CUR) != 0)
+    {
+      error_at (arg_location (offset_arg),
+		"the file %<%s%> was opened but offsetting "
+		"%llu elements of type %qT failed",
+		resource_name, (unsigned long long)offset, unqual_elem_type);
+      return error_mark_node;
+    }
+  const size_t resource_read = fread ((void *)resource_ptr, 1,
+				      resource_size, resource_file);
+  if (resource_read != resource_size)
+    {
+      error_at (limit != NULL ? arg_location (args[6]) : loc,
+		"the file %<%s%> was opened but unable to "
+		"read %llu elements of type %qT failed",
+		resource_name, (unsigned long long)resource_size,
+		unqual_elem_type);
+      return error_mark_node;
+    }
+
+  tree binary_data_ptr = NULL_TREE;
+  if (unqual_elem_type == unsigned_char_type_node
+      || unqual_elem_type == char_type_node
+      || unqual_elem_type == char8_type_node)
+    {
+      /* this is by far the easiest and simplest path, and has some extra
+	 optimizations built in so we don't have to stress about it for
+	 now. This also builds the address expression for binary_data_ptr.  */
+      tree binary_string = build_string_literal (resource_size, resource_ptr,
+						 unqual_elem_type,
+						 HOST_WIDE_INT_M1U);
+      binary_data_ptr = binary_string;
+    }
+  else
+    {
+      /* we have some other type (like an enumeration `std::byte`): build a
+	 real static constant constexpr array and take the address to get the
+	 data pointer we need to function fully.  */
+      tree arr_obj = build_static_constexpr_constant_array (loc,
+							    resource_ptr,
+							    resource_size,
+							    unqual_elem_type,
+							    elem_type);
+      binary_data_ptr =
+	fold_build1_loc (loc, ADDR_EXPR, elem_pointer_type,
+			 build4_loc (loc, ARRAY_REF, elem_type, arr_obj,
+				     integer_zero_node, NULL_TREE, NULL_TREE));
+
+    }
+  tree binary_size_value = build_int_cstu (size_type_node, resource_size);
+  gcc_checking_assert (binary_data_ptr != NULL_TREE);
+  gcc_checking_assert (binary_size_value != NULL_TREE);
+  return fold_status_success (file_found, binary_size_value, binary_data_ptr);
 }
 
 #include "gt-cp-constexpr.h"

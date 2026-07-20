@@ -11362,7 +11362,352 @@ build_string_literal (unsigned len, const char *str /* = NULL */,
   return t;
 }
 
+/* Return a STRING_CST corresponding to ARG's constant initializer either
+   if it's a string constant, or, when VALREP is set, any other constant,
+   or null otherwise.
+   On success, set *PTR_OFFSET to the (possibly non-constant) byte offset
+   within the byte string that ARG is references.  If nonnull set *MEM_SIZE
+   to the size of the byte string.  If nonnull, set *DECL to the constant
+   declaration ARG refers to.  */
 
+tree
+constant_byte_string (tree arg, tree *ptr_offset, tree *mem_size, tree *decl,
+		      bool valrep)
+{
+  tree dummy = NULL_TREE;
+  if (!mem_size)
+    mem_size = &dummy;
+
+  /* Store the type of the original expression before conversions
+     via NOP_EXPR or POINTER_PLUS_EXPR to other types have been
+     removed.  */
+  tree argtype = TREE_TYPE (arg);
+
+  tree array;
+  STRIP_NOPS (arg);
+
+  /* Non-constant index into the character array in an ARRAY_REF
+     expression or null.  */
+  tree varidx = NULL_TREE;
+
+  poly_int64 base_off = 0;
+
+  if (TREE_CODE (arg) == ADDR_EXPR)
+    {
+      arg = TREE_OPERAND (arg, 0);
+      tree ref = arg;
+      if (TREE_CODE (arg) == ARRAY_REF)
+	{
+	  tree idx = TREE_OPERAND (arg, 1);
+	  if (TREE_CODE (idx) != INTEGER_CST)
+	    {
+	      /* From a pointer (but not array) argument extract the variable
+		 index to prevent get_addr_base_and_unit_offset() from failing
+		 due to it.  Use it later to compute the non-constant offset
+		 into the string and return it to the caller.  */
+	      varidx = idx;
+	      ref = TREE_OPERAND (arg, 0);
+
+	      if (TREE_CODE (TREE_TYPE (arg)) == ARRAY_TYPE)
+		return NULL_TREE;
+
+	      if (!integer_zerop (array_ref_low_bound (arg)))
+		return NULL_TREE;
+
+	      if (!integer_onep (array_ref_element_size (arg)))
+		return NULL_TREE;
+	    }
+	}
+      array = get_addr_base_and_unit_offset (ref, &base_off);
+      if (!array
+	  || (TREE_CODE (array) != VAR_DECL
+	      && TREE_CODE (array) != CONST_DECL
+	      && TREE_CODE (array) != STRING_CST))
+	return NULL_TREE;
+    }
+  else if (TREE_CODE (arg) == PLUS_EXPR || TREE_CODE (arg) == POINTER_PLUS_EXPR)
+    {
+      tree arg0 = TREE_OPERAND (arg, 0);
+      tree arg1 = TREE_OPERAND (arg, 1);
+
+      tree offset;
+      tree str = string_constant (arg0, &offset, mem_size, decl);
+      if (!str)
+	{
+	   str = string_constant (arg1, &offset, mem_size, decl);
+	   arg1 = arg0;
+	}
+
+      if (str)
+	{
+	  /* Avoid pointers to arrays (see bug 86622).  */
+	  if (POINTER_TYPE_P (TREE_TYPE (arg))
+	      && TREE_CODE (TREE_TYPE (TREE_TYPE (arg))) == ARRAY_TYPE
+	      && !(decl && !*decl)
+	      && !(decl && tree_fits_uhwi_p (DECL_SIZE_UNIT (*decl))
+		   && tree_fits_uhwi_p (*mem_size)
+		   && tree_int_cst_equal (*mem_size, DECL_SIZE_UNIT (*decl))))
+	    return NULL_TREE;
+
+	  tree type = TREE_TYPE (offset);
+	  arg1 = fold_convert (type, arg1);
+	  *ptr_offset = fold_build2 (PLUS_EXPR, type, offset, arg1);
+	  return str;
+	}
+      return NULL_TREE;
+    }
+  else if (TREE_CODE (arg) == SSA_NAME)
+    {
+      gimple *stmt = SSA_NAME_DEF_STMT (arg);
+      if (!is_gimple_assign (stmt))
+	return NULL_TREE;
+
+      tree rhs1 = gimple_assign_rhs1 (stmt);
+      tree_code code = gimple_assign_rhs_code (stmt);
+      if (code == ADDR_EXPR)
+	return string_constant (rhs1, ptr_offset, mem_size, decl);
+      else if (code != POINTER_PLUS_EXPR)
+	return NULL_TREE;
+
+      tree offset;
+      if (tree str = string_constant (rhs1, &offset, mem_size, decl))
+	{
+	  /* Avoid pointers to arrays (see bug 86622).  */
+	  if (POINTER_TYPE_P (TREE_TYPE (rhs1))
+	      && TREE_CODE (TREE_TYPE (TREE_TYPE (rhs1))) == ARRAY_TYPE
+	      && !(decl && !*decl)
+	      && !(decl && tree_fits_uhwi_p (DECL_SIZE_UNIT (*decl))
+		   && tree_fits_uhwi_p (*mem_size)
+		   && tree_int_cst_equal (*mem_size, DECL_SIZE_UNIT (*decl))))
+	    return NULL_TREE;
+
+	  tree rhs2 = gimple_assign_rhs2 (stmt);
+	  tree type = TREE_TYPE (offset);
+	  rhs2 = fold_convert (type, rhs2);
+	  *ptr_offset = fold_build2 (PLUS_EXPR, type, offset, rhs2);
+	  return str;
+	}
+      return NULL_TREE;
+    }
+  else if (DECL_P (arg))
+    array = arg;
+  else
+    return NULL_TREE;
+
+  tree offset = wide_int_to_tree (sizetype, base_off);
+  if (varidx)
+    {
+      if (TREE_CODE (TREE_TYPE (array)) != ARRAY_TYPE)
+	return NULL_TREE;
+
+      gcc_assert (TREE_CODE (arg) == ARRAY_REF);
+      tree chartype = TREE_TYPE (TREE_TYPE (TREE_OPERAND (arg, 0)));
+      if (TREE_CODE (chartype) != INTEGER_TYPE)
+	return NULL;
+
+      offset = fold_convert (sizetype, varidx);
+    }
+
+  if (TREE_CODE (array) == STRING_CST)
+    {
+      *ptr_offset = fold_convert (sizetype, offset);
+      *mem_size = TYPE_SIZE_UNIT (TREE_TYPE (array));
+      if (decl)
+	*decl = NULL_TREE;
+      gcc_checking_assert (tree_to_shwi (TYPE_SIZE_UNIT (TREE_TYPE (array)))
+			   >= TREE_STRING_LENGTH (array));
+      return array;
+    }
+
+  tree init = ctor_for_folding (array);
+  if (!init || init == error_mark_node)
+    return NULL_TREE;
+
+  if (valrep)
+    {
+      HOST_WIDE_INT cstoff;
+      if (!base_off.is_constant (&cstoff))
+	return NULL_TREE;
+
+      /* Check that the host and target are sane.  */
+      if (CHAR_BIT != 8 || BITS_PER_UNIT != 8)
+	return NULL_TREE;
+
+      HOST_WIDE_INT typesz = int_size_in_bytes (TREE_TYPE (init));
+      if (typesz <= 0 || (int) typesz != typesz)
+	return NULL_TREE;
+
+      HOST_WIDE_INT size = typesz;
+      if (VAR_P (array)
+	  && DECL_SIZE_UNIT (array)
+	  && tree_fits_shwi_p (DECL_SIZE_UNIT (array)))
+	{
+	  size = tree_to_shwi (DECL_SIZE_UNIT (array));
+	  gcc_checking_assert (size >= typesz);
+	}
+
+      /* If value representation was requested convert the initializer
+	 for the whole array or object into a string of bytes forming
+	 its value representation and return it.  */
+      unsigned char *bytes = XNEWVEC (unsigned char, size);
+      int r = native_encode_initializer (init, bytes, size);
+      if (r < typesz)
+	{
+	  XDELETEVEC (bytes);
+	  return NULL_TREE;
+	}
+
+      if (r < size)
+	memset (bytes + r, '\0', size - r);
+
+      const char *p = reinterpret_cast<const char *>(bytes);
+      init = build_string_literal (size, p, char_type_node);
+      init = TREE_OPERAND (init, 0);
+      init = TREE_OPERAND (init, 0);
+      XDELETE (bytes);
+
+      *mem_size = size_int (TREE_STRING_LENGTH (init));
+      *ptr_offset = wide_int_to_tree (ssizetype, base_off);
+
+      if (decl)
+	*decl = array;
+
+      return init;
+    }
+
+  if (TREE_CODE (init) == CONSTRUCTOR)
+    {
+      /* Convert the 64-bit constant offset to a wider type to avoid
+	 overflow and use it to obtain the initializer for the subobject
+	 it points into.  */
+      offset_int wioff;
+      if (!base_off.is_constant (&wioff))
+	return NULL_TREE;
+
+      wioff *= BITS_PER_UNIT;
+      if (!wi::fits_uhwi_p (wioff))
+	return NULL_TREE;
+
+      base_off = wioff.to_uhwi ();
+      unsigned HOST_WIDE_INT fieldoff = 0;
+      init = fold_ctor_reference (TREE_TYPE (arg), init, base_off, 0, array,
+				  &fieldoff);
+      if (!init || init == error_mark_node)
+	return NULL_TREE;
+
+      HOST_WIDE_INT cstoff;
+      if (!base_off.is_constant (&cstoff))
+	return NULL_TREE;
+
+      cstoff = (cstoff - fieldoff) / BITS_PER_UNIT;
+      tree off = build_int_cst (sizetype, cstoff);
+      if (varidx)
+	offset = fold_build2 (PLUS_EXPR, TREE_TYPE (offset), offset, off);
+      else
+	offset = off;
+    }
+
+  *ptr_offset = offset;
+
+  tree inittype = TREE_TYPE (init);
+
+  if (TREE_CODE (init) == INTEGER_CST
+      && (TREE_CODE (TREE_TYPE (array)) == INTEGER_TYPE
+	  || TYPE_MAIN_VARIANT (inittype) == char_type_node))
+    {
+      /* Check that the host and target are sane.  */
+      if (CHAR_BIT != 8 || BITS_PER_UNIT != 8)
+	return NULL_TREE;
+
+      /* For a reference to (address of) a single constant character,
+	 store the native representation of the character in CHARBUF.
+	 If the reference is to an element of an array or a member
+	 of a struct, only consider narrow characters until ctors
+	 for wide character arrays are transformed to STRING_CSTs
+	 like those for narrow arrays.  */
+      unsigned char charbuf[MAX_BITSIZE_MODE_ANY_MODE / BITS_PER_UNIT];
+      int len = native_encode_expr (init, charbuf, sizeof charbuf, 0);
+      if (len > 0)
+	{
+	  /* Construct a string literal with elements of INITTYPE and
+	     the representation above.  Then strip
+	     the ADDR_EXPR (ARRAY_REF (...)) around the STRING_CST.  */
+	  init = build_string_literal (len, (char *)charbuf, inittype);
+	  init = TREE_OPERAND (TREE_OPERAND (init, 0), 0);
+	}
+    }
+
+  tree initsize = TYPE_SIZE_UNIT (inittype);
+
+  if (TREE_CODE (init) == CONSTRUCTOR && initializer_zerop (init))
+    {
+      /* Fold an empty/zero constructor for an implicitly initialized
+	 object or subobject into the empty string.  */
+
+      /* Determine the character type from that of the original
+	 expression.  */
+      tree chartype = argtype;
+      if (POINTER_TYPE_P (chartype))
+	chartype = TREE_TYPE (chartype);
+      while (TREE_CODE (chartype) == ARRAY_TYPE)
+	chartype = TREE_TYPE (chartype);
+
+      if (INTEGRAL_TYPE_P (chartype)
+	  && TYPE_PRECISION (chartype) == TYPE_PRECISION (char_type_node))
+	{
+	  /* Convert a char array to an empty STRING_CST having an array
+	     of the expected type and size.  */
+	  if (!initsize)
+	    initsize = integer_zero_node;
+	  else if (!tree_fits_uhwi_p (initsize))
+	    return NULL_TREE;
+
+	  unsigned HOST_WIDE_INT size = tree_to_uhwi (initsize);
+	  if (size > (unsigned HOST_WIDE_INT) INT_MAX)
+	    return NULL_TREE;
+
+	  init = build_string_literal (size, NULL, chartype, size);
+	  init = TREE_OPERAND (init, 0);
+	  init = TREE_OPERAND (init, 0);
+
+	  *ptr_offset = integer_zero_node;
+	}
+    }
+
+  if (decl)
+    *decl = array;
+
+  if (TREE_CODE (init) != STRING_CST)
+    return NULL_TREE;
+
+  *mem_size = initsize;
+
+  gcc_checking_assert (tree_to_shwi (initsize) >= TREE_STRING_LENGTH (init));
+
+  return init;
+}
+
+/* Return STRING_CST if an ARG corresponds to a string constant or zero
+   if it doesn't.  If we return nonzero, set *PTR_OFFSET to the (possibly
+   non-constant) offset in bytes within the string that ARG is accessing.
+   If MEM_SIZE is non-zero the storage size of the memory is returned.
+   If DECL is non-zero the constant declaration is returned if available.  */
+
+tree
+string_constant (tree arg, tree *ptr_offset, tree *mem_size, tree *decl)
+{
+  return constant_byte_string (arg, ptr_offset, mem_size, decl, false);
+}
+
+/* Similar to string_constant, return a STRING_CST corresponding
+   to the value representation of the first argument if it's
+   a constant.  */
+
+tree
+byte_representation (tree arg, tree *ptr_offset, tree *mem_size, tree *decl)
+{
+  return constant_byte_string (arg, ptr_offset, mem_size, decl, true);
+}
 
 /* Return true if T (assumed to be a DECL) must be assigned a memory
    location.  */

@@ -5669,6 +5669,28 @@ cxx_init_decl_processing (void)
 			       BUILT_IN_FRONTEND, NULL, NULL_TREE);
   set_call_expr_flags (decl, ECF_NOTHROW | ECF_LEAF);
 
+  {
+    tree void_ptr_type = build_pointer_type (void_type_node);
+    tree int_ref_type = build_reference_type (integer_type_node);
+    tree size_ref_type = build_reference_type (size_type_node);
+    tree void_ptr_uint_int_ref_size_ref_va_fn_type
+      = build_varargs_function_type_list (void_ptr_type, unsigned_type_node,
+					  int_ref_type, size_ref_type,
+					  NULL_TREE);
+    tree type_generic_attr = get_identifier ("type generic");
+    tree unused_attr = get_identifier ("warn_unused_result");
+    tree type_generic_attr_list = tree_cons (type_generic_attr,
+					     NULL_TREE, NULL_TREE);
+    tree unused_type_generic_attr_list = tree_cons (unused_attr, NULL_TREE,
+						    type_generic_attr_list);
+    decl
+      = add_builtin_function ("__builtin_std_embed",
+			      void_ptr_uint_int_ref_size_ref_va_fn_type,
+			      CP_BUILT_IN_STD_EMBED, BUILT_IN_FRONTEND,
+			      NULL, unused_type_generic_attr_list);
+    set_call_expr_flags (decl, ECF_CONST | ECF_NOTHROW | ECF_LEAF);
+  }
+
   integer_two_node = build_int_cst (NULL_TREE, 2);
 
   /* Guess at the initial static decls size.  */
