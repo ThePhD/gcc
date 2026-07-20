@@ -4923,6 +4923,41 @@ const scoped_attribute_specs std_attribute_table =
   nullptr, { std_attributes }
 };
 
+/* Do nothing with an alias declaration resolution. */
+static void
+on_resolve_nothing (tree, int, bool, void*) {}
+
+/* Take a declaration and resolve it until it is no longer an alias
+   declaration. Returns DECL if not an alias declaration, otherwise follows
+   the DECL_CHAIN () of all declarations that are C_ALIAS_DECL ()s.
+   ON_RESOLVE is called once per successful resolution of a single chain
+   on a transparent alias, including DECL with ON_RESOLVE (0, DECL) if
+   DECL is proven to be an _Alias declaration.  */
+
+tree
+c_resolve_alias_decl (tree decl, fn_on_alias_resolve *on_resolve, void *context)
+{
+  if (!c_alias_decl_p (decl))
+    return decl;
+  int depth = 0;
+  if (on_resolve == NULL)
+    on_resolve = on_resolve_nothing;
+  const bool next_is_last = !c_alias_decl_p (decl);
+  on_resolve(decl, depth, next_is_last, context);
+  ++depth;
+  for (tree next_decl = DECL_CHAIN (decl);
+       next_decl != NULL_TREE;
+       next_decl = DECL_CHAIN (next_decl), ++depth)
+    {
+      const bool last = !c_alias_decl_p (next_decl);
+      decl = next_decl;
+      on_resolve(decl, depth, last, context);
+      if (last)
+	break;
+    }
+  return decl;
+}
+
 /* Create the predefined scalar types of C,
    and some nodes representing standard constants (0, 1, (void *) 0).
    Initialize the global scope.
@@ -5757,6 +5792,189 @@ c_decl_attributes (tree *node, tree attributes, int flags)
 	set_decl_tls_model (*node, default_model);
     }
   return attr;
+}
+
+/* Work on a pre-built DECL, similar to start_decl.
+   This is called as soon as the type information and variable name
+   have been parsed, before parsing the initializer if any.
+   Here we create the ..._DECL node, fill in its type,
+   and (if DO_PUSH) put it on the list of decls for the current context.
+   When nonnull, set *LASTLOC to the location of the prior declaration
+   of the same entity if one exists.
+   The ..._DECL node is returned as the value.
+
+   Exception: for arrays where the length is not specified,
+   the type is left null, to be filled in by `finish_decl'.
+
+   Function definitions do not come here; they go to start_function
+   instead.  However, external and forward declarations of functions
+   do go through here.  Structure field declarations are done by
+   grokfield and not through here.  */
+
+tree
+continue_decl (tree decl, bool initialized, tree attributes, 
+	    tree expr, bool do_push /* = true */,
+	    location_t *lastloc /* = NULL */)
+{
+  tree old_decl;
+  tree tem;
+  
+  if (!decl || decl == error_mark_node)
+    return NULL_TREE;
+
+  old_decl = lookup_last_decl (decl);
+
+  if (tree lastdecl = lastloc ? old_decl : NULL_TREE)
+    if (lastdecl != error_mark_node)
+      *lastloc = DECL_SOURCE_LOCATION (lastdecl);
+
+  /* Make sure the size expression is evaluated at this point.  */
+  if (expr && !current_scope->parm_flag)
+    add_stmt (fold_convert (void_type_node, expr));
+
+  if (TREE_CODE (decl) != FUNCTION_DECL && MAIN_NAME_P (DECL_NAME (decl))
+      && TREE_PUBLIC (decl))
+    warning (OPT_Wmain, "%q+D is usually a function", decl);
+
+  if (warn_missing_variable_declarations && VAR_P (decl)
+      && !DECL_EXTERNAL (decl) && TREE_PUBLIC (decl) && old_decl == NULL_TREE)
+    warning_at (DECL_SOURCE_LOCATION (decl), OPT_Wmissing_variable_declarations,
+		"no previous declaration for %qD", decl);
+
+  if (initialized)
+    /* Is it valid for this decl to have an initializer at all?
+       If not, set INITIALIZED to zero, which will indirectly
+       tell 'finish_decl' to ignore the initializer once it is parsed.  */
+    switch (TREE_CODE (decl))
+      {
+      case TYPE_DECL:
+	error ("typedef %qD is initialized (use %<__typeof__%> instead)", decl);
+	initialized = false;
+	break;
+
+      case FUNCTION_DECL:
+	error ("function %qD is initialized like a variable", decl);
+	initialized = false;
+	break;
+
+      case PARM_DECL:
+	/* DECL_INITIAL in a PARM_DECL is really DECL_ARG_TYPE.  */
+	error ("parameter %qD is initialized", decl);
+	initialized = false;
+	break;
+
+      default:
+	/* Don't allow initializations for incomplete types except for
+	   arrays which might be completed by the initialization.  */
+
+	/* This can happen if the array size is an undefined macro.
+	   We already gave a warning, so we don't need another one.  */
+	if (TREE_TYPE (decl) == error_mark_node)
+	  initialized = false;
+	else if (COMPLETE_TYPE_P (TREE_TYPE (decl)))
+	  {
+	    /* A complete type is ok if size is fixed.  If the size is
+	       variable, an empty initializer is OK and nonempty
+	       initializers will be diagnosed in the parser.  */
+	  }
+	else if (TREE_CODE (TREE_TYPE (decl)) != ARRAY_TYPE)
+	  {
+	    error ("variable %qD has initializer but incomplete type", decl);
+	    initialized = false;
+	  }
+      }
+
+  if (initialized)
+    {
+      if (current_scope == file_scope)
+	TREE_STATIC (decl) = 1;
+
+      /* Tell 'pushdecl' this is an initialized decl
+	 even though we don't yet have the initializer expression.
+	 Also tell 'finish_decl' it may store the real initializer.  */
+      DECL_INITIAL (decl) = error_mark_node;
+    }
+
+  /* If this is a function declaration, write a record describing it to the
+     prototypes file (if requested).  */
+
+  if (TREE_CODE (decl) == FUNCTION_DECL)
+    gen_aux_info_record (decl, 0, 0, prototype_p (TREE_TYPE (decl)));
+
+  /* ANSI specifies that a tentative definition which is not merged with
+     a non-tentative definition behaves exactly like a definition with an
+     initializer equal to zero.  (Section 3.7.2)
+
+     -fno-common gives strict ANSI behavior, though this tends to break
+     a large body of code that grew up without this rule.
+
+     Thread-local variables are never common, since there's no entrenched
+     body of code to break, and it allows more efficient variable references
+     in the presence of dynamic linking.  */
+
+  if (VAR_P (decl)
+      && !initialized
+      && TREE_PUBLIC (decl)
+      && !DECL_THREAD_LOCAL_P (decl)
+      && !flag_no_common)
+    DECL_COMMON (decl) = 1;
+
+  /* Set attributes here so if duplicate decl, will have proper attributes.  */
+  c_decl_attributes (&decl, attributes, 0);
+
+  if (TREE_CODE (decl) == FUNCTION_DECL
+      && DECL_DECLARED_INLINE_P (decl)
+      && DECL_UNINLINABLE (decl)
+      && lookup_attribute ("noinline", DECL_ATTRIBUTES (decl)))
+    {
+      auto_urlify_attributes sentinel;
+      warning (OPT_Wattributes, "inline function %q+D given attribute %qs",
+	       decl, "noinline");
+    }
+
+  /* C99 6.7.4p3: An inline definition of a function with external
+     linkage shall not contain a definition of a modifiable object
+     with static storage duration...  */
+  if (VAR_P (decl)
+      && current_scope != file_scope
+      && TREE_STATIC (decl)
+      && !TREE_READONLY (decl)
+      && DECL_DECLARED_INLINE_P (current_function_decl)
+      && DECL_EXTERNAL (current_function_decl))
+    record_inline_static (input_location, current_function_decl,
+			  decl, csi_modifiable);
+
+  if (c_dialect_objc ()
+      && VAR_OR_FUNCTION_DECL_P (decl))
+      objc_check_global_decl (decl);
+
+  /* To enable versions to be created across TU's we mark and mangle all
+     non-default versioned functions.  */
+  if (TREE_CODE (decl) == FUNCTION_DECL
+      && !TARGET_HAS_FMV_TARGET_ATTRIBUTE
+      && get_target_version (decl).is_valid ())
+    {
+      maybe_mark_function_versioned (decl);
+      if (current_scope != file_scope)
+	error ("versioned declarations are only allowed at file scope");
+    }
+
+  /* Add this decl to the current scope.
+     TEM may equal DECL or it may be a previous decl of the same name.  */
+  if (do_push)
+    {
+      tem = pushdecl (decl);
+
+      if (initialized && DECL_EXTERNAL (tem))
+	{
+	  DECL_EXTERNAL (tem) = 0;
+	  TREE_STATIC (tem) = 1;
+	}
+
+      return tem;
+    }
+  else
+    return decl;
 }
 
 

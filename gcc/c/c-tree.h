@@ -74,6 +74,9 @@ along with GCC; see the file COPYING3.  If not see
 /* Record whether a typedef for type `int' was actually `signed int'.  */
 #define C_TYPEDEF_EXPLICITLY_SIGNED(EXP) DECL_LANG_FLAG_1 (EXP)
 
+/* For a VAR_DECL, nonzero if it is an _Alias declaration.  */
+#define C_ALIAS_DECL(EXP) DECL_LANG_FLAG_1 (EXP)
+
 /* For a FUNCTION_DECL, nonzero if it was defined without an explicit
    return type.  */
 #define C_FUNCTION_IMPLICIT_INT(EXP) DECL_LANG_FLAG_1 (EXP)
@@ -136,6 +139,10 @@ along with GCC; see the file COPYING3.  If not see
 /* Set on VAR_DECLs for compound literals.  */
 #define C_DECL_COMPOUND_LITERAL_P(DECL) \
   DECL_LANG_FLAG_5 (VAR_DECL_CHECK (DECL))
+
+/* Set on VAR_DECLs declared as 'constexpr'.  */
+#define C_DECL_DECLARED_CONSTEXPR(DECL) \
+  DECL_LANG_FLAG_8 (VAR_DECL_CHECK (DECL))
 
 /* Set on decls used as placeholders for a C23 underspecified object
    definition.  */
@@ -721,6 +728,9 @@ extern tree c_simulate_record_decl (location_t, const char *,
 				    array_slice<const tree>);
 extern struct c_arg_info *build_arg_info (void);
 extern struct c_arg_info *get_parm_info (bool, tree);
+typedef void(fn_on_alias_resolve)(tree, int, bool, void *);
+extern tree c_resolve_alias_decl (tree, fn_on_alias_resolve * = NULL,
+				  void * = NULL);
 extern tree grokfield (location_t, struct c_declarator *,
 		       struct c_declspecs *, tree, tree *, tree *);
 extern tree groktypename (struct c_type_name *, tree *, bool *);
@@ -748,6 +758,8 @@ extern tree start_decl (struct c_declarator *, struct c_declspecs *, bool,
 			tree, bool = true, location_t * = NULL);
 extern tree start_decl_with (tree, bool, tree, tree,
 			     bool = true, location_t * = NULL);
+extern tree continue_decl (tree, bool, tree, tree, bool = true,
+			     location_t * = NULL);
 extern tree start_struct (location_t, enum tree_code, tree,
 			  class c_struct_parse_info **);
 extern void store_parm_decls (void);
@@ -891,6 +903,8 @@ extern void pop_maybe_used (bool);
 extern struct maybe_used_decl *save_maybe_used ();
 extern void restore_maybe_used (struct maybe_used_decl *);
 extern void mark_decl_used (tree, bool);
+extern bool c_alias_decl_target_p (tree);
+extern bool c_alias_decl_p (tree);
 extern struct c_expr c_expr_sizeof_expr (location_t, struct c_expr);
 extern struct c_expr c_expr_sizeof_type (location_t, struct c_type_name *);
 extern struct c_expr c_expr_countof_expr (location_t, struct c_expr);

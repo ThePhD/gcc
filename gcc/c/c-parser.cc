@@ -1021,7 +1021,8 @@ static bool
 c_token_starts_declaration (c_token *token)
 {
   if (c_token_starts_declspecs (token)
-      || token->keyword == RID_STATIC_ASSERT)
+      || token->keyword == RID_STATIC_ASSERT
+      || token->keyword == RID_ALIAS)
     return true;
   else
     return false;
@@ -1949,7 +1950,8 @@ static tree c_parser_std_attribute_specifier_sequence (c_parser *);
 static void c_parser_external_declaration (c_parser *);
 static void c_parser_asm_definition (c_parser *);
 static tree c_parser_declaration_or_fndef (c_parser *, bool, bool, bool,
-					   bool, bool, bool, tree * = NULL,
+					   bool, bool, bool, bool,
+					   tree * = NULL,
 					   vec<c_token> * = NULL,
 					   bool have_attrs = false,
 					   tree attrs = NULL,
@@ -2398,7 +2400,7 @@ c_parser_external_declaration (c_parser *parser)
 	 only tell which after parsing the declaration specifiers, if
 	 any, and the first declarator.  */
       c_parser_declaration_or_fndef (parser, true, true, true, false, true,
-				     false);
+				     false, true);
       break;
     }
 }
@@ -2499,6 +2501,114 @@ c_parser_maybe_reclassify_token (c_parser *parser)
     }
 }
 
+
+/* Parse a transparent alias declaration.
+   The ATTRS, standard and GNU attributes, should come from an outside parsing
+   routine; HAVE_ATTRS is whether or not to use it for this (or ignore it).
+
+     transparent-alias-declaration:
+       attribute-specifier-sequence[opt] _Alias identifier = identifier ;
+  */
+
+static tree
+c_parser_alias_declaration (c_parser *parser, bool have_attrs, tree attrs)
+{
+  gcc_assert (c_parser_next_token_is_keyword (parser, RID_ALIAS));
+  location_t alias_loc = c_parser_peek_token (parser)->location;
+  c_parser_consume_token (parser);
+  c_token *name_tok = c_parser_peek_token (parser);
+  if (name_tok->type != CPP_NAME)
+    {
+      c_parser_error (parser, "expected identifier");
+      return error_mark_node;
+    }
+  location_t name_loc = name_tok->location;
+  tree name_id = name_tok->value;
+  c_parser_consume_token (parser);
+
+  c_token *maybe_eq_tok = c_parser_peek_token (parser);
+  const bool typedef_style = maybe_eq_tok->type != CPP_EQ;
+  location_t target_loc = UNKNOWN_LOCATION;
+  tree target_id = NULL_TREE;
+  if (typedef_style)
+    {
+      if (maybe_eq_tok->type != CPP_NAME)
+      {
+	c_parser_error (parser, "expected an identifier or $<=%>");
+	return error_mark_node;
+      }
+      target_loc = maybe_eq_tok->location;
+      target_id = maybe_eq_tok->value;
+    }
+  else
+    {
+      c_parser_consume_token (parser);
+
+      c_token *target_tok = c_parser_peek_token (parser);
+      if (target_tok->type != CPP_NAME)
+	{
+	  c_parser_error (parser, "expected identifier");
+	  c_parser_skip_until_found(parser, CPP_SEMICOLON, NULL);
+	  return error_mark_node;
+	}
+      target_loc = target_tok->location;
+      target_id = target_tok->value;
+    }
+  c_parser_consume_token (parser);	
+
+  if (c_parser_next_token_is_not (parser, CPP_SEMICOLON))
+    {
+      c_parser_error (parser, "expected %<;%>");
+      c_parser_skip_until_found(parser, CPP_SEMICOLON, NULL);
+      return error_mark_node;
+    }
+  c_parser_consume_token (parser);
+  gcc_assert(TREE_CODE (name_id) == IDENTIFIER_NODE);
+  gcc_assert(TREE_CODE (target_id) == IDENTIFIER_NODE);
+  if (typedef_style)
+    {
+      std::swap (target_loc, name_loc);
+      std::swap (target_id, name_id);
+      pedwarn (maybe_eq_tok->location, OPT_Wpedantic,
+	       "not using $<=$> to declare an alias reverses the name "
+	       "%qE and target %qE identifiers", name_id, target_id);
+      inform (target_loc, "this is now the transparent alias's target");
+      inform (name_loc, "this is now the transparent alias's name");
+    }
+  
+  tree target_decl = lookup_name (target_id);
+  if (!c_alias_decl_target_p (target_decl))
+    {
+      error_at (target_loc, "%qD is not a transparent alias, function, "
+		"parameter, or object declaration", target_decl);
+      return error_mark_node;
+    }
+  tree target_type = TREE_TYPE (target_decl);
+  if (!c_alias_decl_p (target_decl)
+      && TREE_CODE (target_type) == FUNCTION_TYPE)
+    {
+      /* Ensure the variable declaration just points to the function
+	 *pointer* type, and address of the object.  */
+      target_type = c_build_pointer_type (target_type);
+      target_decl = build_unary_op (target_loc, ADDR_EXPR,
+				    target_decl, false);
+    }
+  tree alias_decl = build_decl (alias_loc, VAR_DECL, name_id, target_type);
+  if (global_bindings_p())
+      TREE_STATIC (alias_decl) = 1;
+  DECL_EXTERNAL (alias_decl) = 1; /* refers to outside value.  */
+
+  alias_decl = continue_decl (alias_decl, false,
+				have_attrs ? attrs : NULL_TREE,
+				NULL_TREE, true, NULL);
+  finish_decl (alias_decl, target_loc, NULL,
+	       target_type, NULL_TREE);
+  DECL_CHAIN (alias_decl) = target_decl;
+  C_ALIAS_DECL (alias_decl) = 1;
+
+  return alias_decl;
+}
+
 /* Parse a declaration or function definition (C90 6.5, 6.7.1, C99
    6.7, 6.9.1, C11 6.7, 6.9.1).  If FNDEF_OK is true, a function definition
    is accepted; otherwise (old-style parameter declarations) only other
@@ -2524,13 +2634,15 @@ c_parser_maybe_reclassify_token (c_parser *parser)
    in that case, the ';' is not consumed (left to the caller so that it
    can figure out if there was a simple-declaration or not), there must
    be an initializer, and only one object may be declared.  When SIMPLE_OK
-   is true we are called from c_parser_selection_header.
+   is true we are called from c_parser_selection_header. When ALIAS_OK is true,
+   attempts to parse a transparent alias declaration.
 
    Returns the resulting declaration, if there was any with an initializer.
 
    declaration:
      declaration-specifiers init-declarator-list[opt] ;
      static_assert-declaration
+     transparent-alias-declaration
 
    function-definition:
      declaration-specifiers[opt] declarator declaration-list[opt]
@@ -2602,7 +2714,7 @@ static tree
 c_parser_declaration_or_fndef (c_parser *parser, bool fndef_ok,
 			       bool static_assert_ok, bool empty_ok,
 			       bool nested, bool start_attr_ok,
-			       bool simple_ok,
+			       bool simple_ok, bool alias_ok,
 			       tree *objc_foreach_object_declaration
 			       /* = NULL */,
 			       vec<c_token> *omp_declare_simd_clauses
@@ -2628,6 +2740,21 @@ c_parser_declaration_or_fndef (c_parser *parser, bool fndef_ok,
       c_parser_static_assert_declaration (parser);
       return result;
     }
+
+  if (alias_ok)
+    {
+      if (have_attrs && c_parser_next_token_is_keyword (parser, RID_ALIAS))
+	return c_parser_alias_declaration (parser, have_attrs, attrs);
+      if (c_parser_nth_token_starts_std_attributes (parser, 1))
+	{
+	  tree maybe_alias_attrs = c_parser_std_attribute_specifier_sequence (parser);
+          attrs = attrs ? chainon(attrs, maybe_alias_attrs) : maybe_alias_attrs;
+	  have_attrs = true;
+	}
+      if (c_parser_next_token_is_keyword (parser, RID_ALIAS))
+	return c_parser_alias_declaration (parser, have_attrs, attrs);
+    }
+
   specs = build_null_declspecs ();
 
   /* Handle any standard attributes parsed in the caller.  */
@@ -3441,7 +3568,7 @@ c_parser_declaration_or_fndef (c_parser *parser, bool fndef_ok,
       while (c_parser_next_token_is_not (parser, CPP_EOF)
 	     && c_parser_next_token_is_not (parser, CPP_OPEN_BRACE))
 	c_parser_declaration_or_fndef (parser, false, false, false,
-				       true, false, false);
+				       true, false, false, true);
       debug_nonbind_markers_p = save_debug_nonbind_markers_p;
       store_parm_decls ();
       if (omp_declare_simd_clauses)
@@ -7984,7 +8111,7 @@ c_parser_compound_statement_nostart (c_parser *parser)
 	  mark_valid_location_for_stdc_pragma (false);
 	  bool fallthru_attr_p = false;
 	  c_parser_declaration_or_fndef (parser, true, !have_std_attrs,
-					 true, true, true, false, NULL,
+					 true, true, true, false, true, NULL,
 					 NULL, have_std_attrs, std_attrs,
 					 NULL, &fallthru_attr_p);
 
@@ -8027,7 +8154,7 @@ c_parser_compound_statement_nostart (c_parser *parser)
 		}
 	      mark_valid_location_for_stdc_pragma (false);
 	      c_parser_declaration_or_fndef (parser, true, true, true, true,
-					     true, false);
+					     true, false, true);
 	      if (in_omp_loop_block)
 		omp_for_parse_state->want_nested_loop = want_nested_loop;
 	      /* Following the old parser, __extension__ does not
@@ -8791,6 +8918,7 @@ c_parser_selection_header (c_parser *parser, bool switch_p)
 					 /*nested=*/true,
 					 /*start_attr_ok=*/true,
 					 /*simple_ok=*/true,
+					 /*alias_ok=*/false,
 					 /*objc_foreach_object_decl=*/nullptr,
 					 /*omp_declare_simd_clauses=*/nullptr,
 					 have_std_attrs,
@@ -9397,7 +9525,7 @@ c_parser_for_statement (c_parser *parser, bool ivdep, unsigned short unroll,
 	       || c_parser_nth_token_starts_std_attributes (parser, 1))
 	{
 	  c_parser_declaration_or_fndef (parser, true, true, true, true, true,
-					 false, &object_expression);
+					 false, false, &object_expression);
 	  parser->objc_could_be_foreach_context = false;
 
 	  if (c_parser_next_token_is_keyword (parser, RID_IN))
@@ -9428,7 +9556,8 @@ c_parser_for_statement (c_parser *parser, bool ivdep, unsigned short unroll,
 	      ext = disable_extension_diagnostics ();
 	      c_parser_consume_token (parser);
 	      c_parser_declaration_or_fndef (parser, true, true, true, true,
-					     true, false, &object_expression);
+					     true, false, true,
+					     &object_expression);
 	      parser->objc_could_be_foreach_context = false;
 
 	      restore_extension_diagnostics (ext);
@@ -15492,7 +15621,7 @@ c_parser_objc_methodprotolist (c_parser *parser)
 	    }
 	  else
 	    c_parser_declaration_or_fndef (parser, false, false, true,
-					   false, true, false);
+					   false, true, false, true);
 	  break;
 	}
     }
@@ -23843,12 +23972,14 @@ c_parser_oacc_routine (c_parser *parser, enum pragma_context context)
 	  while (c_parser_next_token_is (parser, CPP_KEYWORD)
 		 && c_parser_peek_token (parser)->keyword == RID_EXTENSION);
 	  c_parser_declaration_or_fndef (parser, true, true, true, false, true,
-					 false, NULL, NULL, false, NULL, &data);
+					 false, true, NULL, NULL, false, NULL,
+					 &data);
 	  restore_extension_diagnostics (ext);
 	}
       else
 	c_parser_declaration_or_fndef (parser, true, true, true, false, true,
-				       false, NULL, NULL, false, NULL, &data);
+				       false, true, NULL, NULL, false, NULL,
+				       &data);
     }
 }
 
@@ -25819,7 +25950,7 @@ c_parser_omp_loop_nest (c_parser *parser, bool *if_p)
       tree this_pre_body = push_stmt_list ();
       c_in_omp_for = true;
       c_parser_declaration_or_fndef (parser, true, true, true, true, true,
-				     false);
+				     false, true);
       c_in_omp_for = false;
       this_pre_body = pop_stmt_list (this_pre_body);
       append_to_statement_list_force (this_pre_body,
@@ -28258,12 +28389,12 @@ c_parser_omp_declare_simd (c_parser *parser, enum pragma_context context)
 	  while (c_parser_next_token_is (parser, CPP_KEYWORD)
 		 && c_parser_peek_token (parser)->keyword == RID_EXTENSION);
 	  c_parser_declaration_or_fndef (parser, true, true, true, false, true,
-					 false, NULL, &clauses);
+					 false, true, NULL, &clauses);
 	  restore_extension_diagnostics (ext);
 	}
       else
 	c_parser_declaration_or_fndef (parser, true, true, true, false, true,
-				       false, NULL, &clauses);
+				       false, true, NULL, &clauses);
       break;
     case pragma_struct:
     case pragma_param:
@@ -28292,8 +28423,9 @@ c_parser_omp_declare_simd (c_parser *parser, enum pragma_context context)
 	      || c_parser_nth_token_starts_std_attributes (parser, 1))
 	    {
 	      c_parser_declaration_or_fndef (parser, true, true, true, true,
-					     true, false, NULL, &clauses,
-					     have_std_attrs, std_attrs);
+					     true, false, true, NULL,
+					     &clauses, have_std_attrs,
+					     std_attrs);
 	      restore_extension_diagnostics (ext);
 	      break;
 	    }
@@ -28302,8 +28434,8 @@ c_parser_omp_declare_simd (c_parser *parser, enum pragma_context context)
       else if (c_parser_next_tokens_start_declaration (parser))
 	{
 	  c_parser_declaration_or_fndef (parser, true, true, true, true, true,
-					 false, NULL, &clauses, have_std_attrs,
-					 std_attrs);
+					 false, true, NULL, &clauses,
+					 have_std_attrs, std_attrs);
 	  break;
 	}
       error ("%<#pragma omp declare %s%> must be followed by "
