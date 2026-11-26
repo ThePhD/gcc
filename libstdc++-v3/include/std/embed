@@ -43,6 +43,7 @@
 #include <bits/move.h>
 #include <span>
 #include <optional>
+#include <variant>
 #include <source_location>
 #include <string_view>
 #include <cstddef>
@@ -58,6 +59,37 @@ namespace std _GLIBCXX_VISIBILITY(default)
 {
 _GLIBCXX_BEGIN_NAMESPACE_VERSION
 
+/// @cond undocumented
+namespace __embed
+{
+  constexpr void
+  __what_to_u8what(optional<string> &__what, u8string& __u8what)
+  noexcept
+  {
+    /* FIXME: we are just assuming the ordinary literal encoding
+       can handle UTF-8.  */
+    const size_t __what_size = __what->size();
+    __u8what.resize(__what_size);
+    string& __wh = *__what;
+    for (size_t __idx = 0; __idx < __what_size; ++__idx)
+      __u8what[__idx] = __wh[__idx];
+    }
+
+  constexpr void
+  __u8what_to_what(optional<string> &__what, u8string& __u8what)
+  noexcept
+  {
+    /* FIXME: we are just assuming the ordinary literal encoding
+       can handle UTF-8.  */
+    const size_t __u8what_size = __u8what.size();
+    __what.emplace(__u8what_size, '\0');
+    string& __wh = *__what;
+    for (size_t __idx = 0; __idx < __u8what_size; ++__idx)
+      __wh[__idx] = static_cast<char>(__u8what[__idx]);
+  }
+}
+/// @endcond
+
   /**
    * @defgroup embed Binary data at compile-time
    * @addtogroup embed
@@ -69,39 +101,74 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
   class file_not_found_error : public std::exception
   {
   private:
+    variant<string, wstring, u8string> _M_resource_name;
     optional<string> _M_what;
     u8string _M_u8what;
     source_location _M_where;
 
   public:
     consteval
-    file_not_found_error(u8string_view __u8what,
+    file_not_found_error(string_view __which,
+			 u8string_view __u8what,
 			 source_location __where = source_location::current())
     noexcept
-    : _M_what(), _M_u8what(__u8what), _M_where(std::move(__where))
+    : _M_resource_name(in_place_type<string>, __which), _M_what(),
+      _M_u8what(__u8what), _M_where(std::move(__where))
     {
-      /* FIXME: we are just assuming the ordinary literal encoding
-	 can handle UTF-8.  */
-      const size_t __u8what_size = _M_u8what.size();
-      _M_what.emplace(__u8what_size, '\0');
-      string& __wh = *_M_what;
-      for (size_t __idx = 0; __idx < __u8what_size; ++__idx)
-       __wh[__idx] = static_cast<char>(_M_u8what[__idx]);
+      __embed::__u8what_to_what(_M_what, _M_u8what);
     }
 
     consteval
-    file_not_found_error(string_view __what,
+    file_not_found_error(string_view __which,
+			 string_view __what,
 			 source_location __where = source_location::current())
     noexcept
-    : _M_what(__what), _M_u8what(), _M_where(std::move(__where))
+    : _M_resource_name(in_place_type<string>, __which), _M_what(__what),
+      _M_u8what(), _M_where(std::move(__where))
     {
-      /* FIXME: we are just assuming the ordinary literal encoding
-	 can handle UTF-8.  */
-      const size_t __what_size = _M_what->size();
-      _M_u8what.resize(__what_size);
-      string& __wh = *_M_what;
-      for (size_t __idx = 0; __idx < __what_size; ++__idx)
-	_M_u8what[__idx] = __wh[__idx];
+      __embed::__what_to_u8what(_M_what, _M_u8what);
+    }
+    consteval
+    file_not_found_error(wstring_view __which,
+			 u8string_view __u8what,
+			 source_location __where = source_location::current())
+    noexcept
+    : _M_resource_name(in_place_type<wstring>, __which), _M_what(),
+      _M_u8what(__u8what), _M_where(std::move(__where))
+    {
+      __embed::__u8what_to_what(_M_what, _M_u8what);
+    }
+
+    consteval
+    file_not_found_error(wstring_view __which,
+			 string_view __what,
+			 source_location __where = source_location::current())
+    noexcept
+    : _M_resource_name(in_place_type<wstring>, __which), _M_what(__what),
+      _M_u8what(), _M_where(std::move(__where))
+    {
+      __embed::__what_to_u8what(_M_what, _M_u8what);
+    }
+    consteval
+    file_not_found_error(u8string_view __which,
+			 u8string_view __u8what,
+			 source_location __where = source_location::current())
+    noexcept
+    : _M_resource_name(in_place_type<u8string>, __which), _M_what(),
+      _M_u8what(__u8what), _M_where(std::move(__where))
+    {
+      __embed::__u8what_to_what(_M_what, _M_u8what);
+    }
+
+    consteval
+    file_not_found_error(u8string_view __which,
+			 string_view __what,
+			 source_location __where = source_location::current())
+    noexcept
+    : _M_resource_name(in_place_type<u8string>, __which), _M_what(__what),
+      _M_u8what(), _M_where(std::move(__where))
+    {
+      __embed::__what_to_u8what(_M_what, _M_u8what);
     }
 
     file_not_found_error(const file_not_found_error&) = default;
@@ -109,6 +176,22 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
 
     file_not_found_error& operator=(const file_not_found_error&) = default;
     file_not_found_error& operator=(file_not_found_error&&)      = default;
+
+    constexpr const variant<string, wstring, u8string>&
+    resource_name() const noexcept
+    { return _M_resource_name; }
+
+    constexpr const string&
+    which() const noexcept
+    { return ::std::get<string>(_M_resource_name); }
+
+    constexpr const wstring&
+    wwhich() const noexcept
+    { return ::std::get<wstring>(_M_resource_name); }
+
+    constexpr const u8string&
+    u8which() const noexcept
+    { return ::std::get<u8string>(_M_resource_name); }
 
     constexpr const char*
     what() const noexcept override
@@ -127,39 +210,68 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
   class dependency_error : public std::exception
   {
   private:
+    variant<string, wstring, u8string> _M_resource_name;
     optional<string> _M_what;
     u8string _M_u8what;
     source_location _M_where;
 
   public:
     consteval
-    dependency_error(u8string_view __u8what,
+    dependency_error(string_view __which, u8string_view __u8what,
 		     source_location __where = source_location::current())
     noexcept
-    : _M_what(), _M_u8what(__u8what), _M_where(std::move(__where))
+    : _M_resource_name(in_place_type<string>, __which), _M_what(),
+      _M_u8what(__u8what), _M_where(std::move(__where))
     {
-      /* FIXME: we are just assuming the ordinary literal encoding
-	 can handle UTF-8.  */
-      const size_t __u8what_size = _M_u8what.size();
-      _M_what.emplace(__u8what_size, '\0');
-      string& __wh = *_M_what;
-      for (size_t __idx = 0; __idx < __u8what_size; ++__idx)
-       __wh[__idx] = static_cast<char>(_M_u8what[__idx]);
+      __embed::__u8what_to_what(_M_what, _M_u8what);
     }
 
     consteval
-    dependency_error(string_view __what,
+    dependency_error(string_view __which, string_view __what,
 		     source_location __where = source_location::current())
     noexcept
-    : _M_what(__what), _M_u8what(), _M_where(std::move(__where))
+    : _M_resource_name(in_place_type<string>, __which), _M_what(__what),
+      _M_u8what(), _M_where(std::move(__where))
     {
-      /* FIXME: we are just assuming the ordinary literal encoding
-	 can handle UTF-8.  */
-      const size_t __what_size = _M_what->size();
-      _M_u8what.resize(__what_size);
-      string& __wh = *_M_what;
-      for (size_t __idx = 0; __idx < __what_size; ++__idx)
-	_M_u8what[__idx] = __wh[__idx];
+      __embed::__what_to_u8what(_M_what, _M_u8what);
+    }
+    consteval
+    dependency_error(wstring_view __which, u8string_view __u8what,
+		     source_location __where = source_location::current())
+    noexcept
+    : _M_resource_name(in_place_type<wstring>, __which), _M_what(),
+      _M_u8what(__u8what), _M_where(std::move(__where))
+    {
+      __embed::__u8what_to_what(_M_what, _M_u8what);
+    }
+
+    consteval
+    dependency_error(wstring_view __which, string_view __what,
+		     source_location __where = source_location::current())
+    noexcept
+    : _M_resource_name(in_place_type<wstring>, __which), _M_what(__what),
+      _M_u8what(), _M_where(std::move(__where))
+    {
+      __embed::__what_to_u8what(_M_what, _M_u8what);
+    }
+    consteval
+    dependency_error(u8string_view __which, u8string_view __u8what,
+		     source_location __where = source_location::current())
+    noexcept
+    : _M_resource_name(in_place_type<u8string>, __which), _M_what(),
+      _M_u8what(__u8what), _M_where(std::move(__where))
+    {
+      __embed::__u8what_to_what(_M_what, _M_u8what);
+    }
+
+    consteval
+    dependency_error(u8string_view __which, string_view __what,
+		     source_location __where = source_location::current())
+    noexcept
+    : _M_resource_name(in_place_type<u8string>, __which), _M_what(__what),
+      _M_u8what(), _M_where(std::move(__where))
+    {
+      __embed::__what_to_u8what(_M_what, _M_u8what);
     }
 
     dependency_error(const dependency_error&) = default;
@@ -167,6 +279,22 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
 
     dependency_error& operator=(const dependency_error&) = default;
     dependency_error& operator=(dependency_error&&)      = default;
+
+    constexpr const variant<string, wstring, u8string>&
+    resource_name() const noexcept
+    { return _M_resource_name; }
+
+    constexpr const string&
+    which() const noexcept
+    { return ::std::get<string>(_M_resource_name); }
+
+    constexpr const wstring&
+    wwhich() const noexcept
+    { return ::std::get<wstring>(_M_resource_name); }
+
+    constexpr const u8string&
+    u8which() const noexcept
+    { return ::std::get<u8string>(_M_resource_name); }
 
     constexpr const char*
     what() const noexcept override
@@ -204,9 +332,9 @@ namespace __embed
     } while(false)
 
 #if defined(__cpp_constexpr_exceptions) && defined(__cpp_exceptions)
-#define _GLIBCXX_EMBED_FAIL_WITH(_TY, _MSG, _LOC) throw _TY(_MSG, _LOC)
+#define _GLIBCXX_EMBED_FAIL_WITH(_TY, _NAME, _MSG, _LOC) throw _TY(_NAME, _MSG, _LOC)
 #else
-#define _GLIBCXX_EMBED_FAIL_WITH(_TY, _MSG, _LOC) _GLIBCXX_EMBED_FAIL(_MSG)
+#define _GLIBCXX_EMBED_FAIL_WITH(_TY, _NAME, _MSG, _LOC) _GLIBCXX_EMBED_FAIL(_MSG)
 #endif
   // generic implementation to save on copy-paste nonsense
   // and not come up with clever constraints for the `__resource`
@@ -216,7 +344,6 @@ namespace __embed
     consteval span<const _By, _Ex>
     __embed(const _Sv& __resource, size_t __offset,
 	    [[maybe_unused]] const optional<size_t>& __limit)
-    noexcept
     {
       int __status = -1;
       _By const* __ptr = nullptr;
@@ -248,8 +375,8 @@ namespace __embed
 #else
 	  [[maybe_unused]] auto __loc = source_location::current();
 #endif
-	  _GLIBCXX_EMBED_FAIL_WITH(dependency_error,
-			   "file not covered by a '#depend' directive", __loc);
+	  _GLIBCXX_EMBED_FAIL_WITH(file_not_found_error, __resource,
+			   "file not found", __loc);
 	}
       if (__status == __file_found_no_depends)
 	{
@@ -259,7 +386,7 @@ namespace __embed
 #else
 	  [[maybe_unused]] auto __loc = source_location::current();
 #endif
-	  _GLIBCXX_EMBED_FAIL_WITH(dependency_error,
+	  _GLIBCXX_EMBED_FAIL_WITH(dependency_error, __resource,
 			   "file not covered by a '#depend' directive", __loc);
 	}
       if constexpr (_Ex != dynamic_extent)
@@ -301,7 +428,6 @@ namespace __embed
     consteval span<const _By>
     embed(string_view __resource, size_t __offset = 0,
 	  optional<size_t> __limit = nullopt)
-    noexcept
     {
       return __embed::__embed<_By, dynamic_extent>(__resource, __offset, __limit);
     }
@@ -322,7 +448,6 @@ namespace __embed
     [[nodiscard]]
     consteval span<const _By>
     embed(wstring_view __resource, size_t __offset = 0, optional<size_t> __limit = nullopt)
-    noexcept
     {
       return __embed::__embed<_By, dynamic_extent>(__resource, __offset, __limit);
     }
@@ -343,7 +468,6 @@ namespace __embed
     [[nodiscard]]
     consteval span<const _By>
     embed(u8string_view __resource, size_t __offset = 0, optional<size_t> __limit = nullopt)
-    noexcept
     {
       return __embed::__embed<_By, dynamic_extent>(__resource, __offset, __limit);
     }
@@ -362,7 +486,6 @@ namespace __embed
     [[nodiscard]]
     consteval span<const _By, _Ex>
     embed(string_view __resource, size_t __offset = 0)
-    noexcept
     {
       return __embed::__embed<_By, _Ex>(__resource, __offset, nullopt);
     }
@@ -381,7 +504,6 @@ namespace __embed
     [[nodiscard]]
     consteval span<const _By, _Ex>
     embed(wstring_view __resource, size_t __offset = 0)
-    noexcept
     {
       return __embed::__embed<_By, _Ex>(__resource, __offset, nullopt);
     }
@@ -400,7 +522,6 @@ namespace __embed
     [[nodiscard]]
     consteval span<const _By, _Ex>
     embed(u8string_view __resource, size_t __offset = 0)
-    noexcept
     {
       return __embed::__embed<_By, _Ex>(__resource, __offset, nullopt);
     }

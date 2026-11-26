@@ -14114,6 +14114,102 @@ build_static_constexpr_constant_array (location_t loc, void *data,
   return var;
 }
 
+/* Attempts to read a string-like array, pointer to string, or string constant
+   out of EXPR. It will read up to a null terminator OR, if MAYBE_EXPECTED_LEN
+   is not-null, up to the expected length. MAYBE_EXPECTED_LEN is # of elements,
+   NOT the number of bytes. OUT_TYPE, OUT_BYTE_SIZE and OUT, on success, will
+   contain the string's element type (no-CV qualifiers), string's byte size,
+   and a pointer to the **ALLOCATED** data. *OUT must be freed by the user
+   when done.
+
+   If EXPR refers to a string constant, then on success EXPR_OFFSET and
+   EXPR_SIZE refers to the true size of the originating string.
+
+   Returns 0 for success, 1+ for failure. Failure means any OUT parameters
+   are not written into, and nothing needs to be freed.
+
+   Errors:
+     1 - general failure to get any string data. 
+     2 - MAYBE_EXPECTED_LEN is not-null and it was not the
+	 expected length.  */
+
+static int
+cp_any_sized_string_pointer (tree expr,
+			     unsigned HOST_WIDE_INT const *maybe_min_len,
+			     unsigned HOST_WIDE_INT *out_byte_size,
+			     void **out, tree *expr_elem_type,
+			     unsigned HOST_WIDE_INT *expr_offset,
+			     unsigned HOST_WIDE_INT *expr_size)
+{
+  unsigned HOST_WIDE_INT local_out_byte_size = 0;
+  unsigned HOST_WIDE_INT local_expr_size = 0;
+  unsigned HOST_WIDE_INT local_expr_offset = 0;
+  tree local_expr_elem_type = NULL_TREE;
+  const bool write_out = out && *out;
+  if (!out_byte_size)
+    out_byte_size = &local_out_byte_size;
+  if (!expr_size)
+    expr_size = &local_expr_size;
+  if (!expr_offset)
+    expr_offset = &local_expr_offset;
+  if (!expr_elem_type)
+    expr_elem_type = &local_expr_elem_type;
+  tree offset_value = NULL_TREE;
+  tree full_size_value = NULL_TREE;
+  expr = STRIP_NOPS (expr);
+  tree root_str_decl = string_constant (expr, &offset_value, &full_size_value,
+					NULL);
+  if (root_str_decl != NULL_TREE)
+    {
+      unsigned HOST_WIDE_INT offset =
+	offset_value == NULL_TREE ? 0 :
+	tree_to_uhwi (offset_value);
+      unsigned HOST_WIDE_INT full_size =
+	full_size_value == NULL_TREE ? 0 :
+	tree_to_uhwi (full_size_value);
+      unsigned HOST_WIDE_INT len = maybe_min_len
+	? *maybe_min_len
+	: full_size_value;
+      /* sanity check: out-of-bounds access in resource name string;
+         this should have been caught much, much earlier.  */
+      if (maybe_expected_len && (full_size < offset ||
+	((full_size - offset) < len)))
+	{
+	  return 2;
+	}
+      const char *root_str =
+	TREE_STRING_POINTER (root_str_decl);
+      const char *source_str = root_str + resource_root_offset;
+      const char *resource_name = (const char *)resource_name_raw_ptr;
+      tree elem_type = TREE_TYPE (TREE_TYPE (TREE_MAIN_VARIANT (expr)));
+      unsigned HOST_WIDE_INT elem_type_size =
+	tree_to_uhwi (TYPE_SIZE_UNIT (elem_type));
+      if (len > (unsigned HOST_WIDE_INT)UINT_MAX)
+	{
+	  return 3;
+	}
+      unsigned int byte_size =
+	(unsigned int)(len * elem_type_size);
+      if (write_out)
+	{
+	  *out = XCNEWVEC (char, byte_size);
+	  memcpy(*out, source_str, byte_size)
+	}
+      *out_byte_size = byte_size;
+      *expr_elem_type = elem_type;
+      *expr_offset = offset;
+      *expr_size = full_size_value;
+      return 0;
+    }
+  /* at this point we have things like
+       - arrays themselves that aren't STRING_CST
+       - constant initializers in VECTOR inits
+       - etc...
+     so we just... add handling for various cases, as best as we can.  */
+  
+  return 1;
+}
+
 tree
 cp_fold_builtin_std_embed (location_t loc, int nargs,
 			   location_t * arg_locs, tree *args)
@@ -14198,13 +14294,17 @@ cp_fold_builtin_std_embed (location_t loc, int nargs,
   tree elem_type = TREE_TYPE (TREE_TYPE (ptr_indicator_arg));
   tree unqual_elem_type = TYPE_MAIN_VARIANT (elem_type);
   tree elem_pointer_type = build_pointer_type (elem_type);
-  tree resource_root_offset_value = NULL_TREE;
-  tree resource_root_size_value = NULL_TREE;
-  tree resource_root_str_value = string_constant (resource_name_ptr_arg,
-						  &resource_root_offset_value,
-						  &resource_root_size_value,
-						  NULL);
-  if (resource_root_str_value == NULL_TREE)
+  tree resource_name_type = NULL_TREE;
+  void *resource_name_raw_ptr = NULL;
+  unsigned HOST_WIDE_INT resource_name_raw_size = 0;
+  int status = cp_any_sized_string_pointer(resource_name_ptr_arg,
+					   &resource_name_lenh,
+					   &resource_name_raw_size,
+					   &resource_name_raw_ptr,
+					   &resource_name_type,
+					   &resource_root_offset_value,
+					   &resource_root_size_value);
+  if (status == 1)
     {
       /* DETAILS, FIXME: if you are getting this error / reading this, this is
 	 a problem with relying on string_constant to read string values as it
@@ -14229,16 +14329,7 @@ cp_fold_builtin_std_embed (location_t loc, int nargs,
 		TREE_TYPE (resource_name_ptr_arg), resource_name_ptr_arg);
       return error_mark_node;
     }
-  unsigned HOST_WIDE_INT resource_root_offset =
-    resource_root_offset_value == NULL_TREE ? 0 : 
-      tree_to_uhwi (resource_root_offset_value);
-  unsigned HOST_WIDE_INT resource_root_size =
-    resource_root_size_value == NULL_TREE ? 0 : 
-      tree_to_uhwi (resource_root_size_value);
-  /* sanity check: out-of-bounds access in resource name string;
-     this should have been caught much, much earlier.  */
-  if (resource_root_size < resource_root_offset
-      || ((resource_root_size - resource_root_offset) < resource_name_lenh))
+  if (status == 2)
     {
       error_at (arg_location (resource_name_size_arg),
 		"source string of size %llu and offset %llu is not usable "
@@ -14285,25 +14376,24 @@ cp_fold_builtin_std_embed (location_t loc, int nargs,
       return fold_build2_loc (loc, COMPOUND_EXPR, elem_pointer_type,
 			      size_write, status_and_ptr);
     };
-
-  const char *original_resource_name =
-    TREE_STRING_POINTER (resource_root_str_value) + resource_root_offset;
-  const char *resource_name = original_resource_name;
-  if (resource_name_lenh > (unsigned HOST_WIDE_INT)UINT_MAX)
+  if (status == 3)
     {
       error_at (arg_location (resource_name_size_arg),
 		"%llu is too large to use for the resource name size",
 		(unsigned long long)resource_name_lenh);
       return error_mark_node;
     }
-  tree resource_name_arr_type = TREE_TYPE (resource_root_str_value);
-  tree resource_name_arr_elem_type = TREE_TYPE (resource_name_arr_type);
-  tree resource_name_type = TYPE_MAIN_VARIANT (resource_name_arr_elem_type);
-  unsigned HOST_WIDE_INT type_name_size =
+  if (status != 0)
+    {
+      error_at (arg_location (resource_name_ptr_arg),
+		"could not read the resource name");
+      return error_mark_node;
+    }
+  unsigned HOST_WIDE_INT name_type_size =
     tree_to_uhwi (TYPE_SIZE_UNIT (resource_name_type));
   unsigned int resource_name_len =
-    (unsigned int)(resource_name_lenh * type_name_size);
-  if (type_name_size != 1)
+    (unsigned int)(resource_name_raw_size / name_type_size);
+  if (name_type_size != 1)
     {
       /* must be a wide character type; need to convert based on libcp.  */
       const unsigned char *uresource_name =
@@ -14334,9 +14424,7 @@ cp_fold_builtin_std_embed (location_t loc, int nargs,
     };
 
   cleanup_name_t cleanup_resource_name =
-    {
-      resource_name == original_resource_name ? NULL : resource_name
-    };
+    { resource_name };
   static constexpr const char *empty_sentinel = "";
   const char *lookup_from = NULL;
   if (do_local_search)
